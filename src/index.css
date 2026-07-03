@@ -1,0 +1,52 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+:root {
+  --color-background: rgba(0, 79, 59, 1);
+  --color-bgdark: rgba(0, 44, 34, 1);
+  --color-border: rgba(0, 96, 69, 1);
+  --color-accent: rgba(0, 200, 140, 1);
+  --color-white: #ffffff;
+  --color-textWH: #ffffff;
+  --color-error: rgb(255, 77, 77);
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  background: linear-gradient(to bottom, rgba(0, 73, 55, 1), rgba(0, 47, 36, 1));
+  background-attachment: fixed;
+  color: var(--color-text);
+  font-family: 'Inter', 'Inter Fallback', sans-serif;
+  min-height: 100vh;
+}
+
+button {
+  cursor: pointer;
+  border: none;
+  outline: none;
+}
+
+input {
+  outline: none;
+}
+
+input::placeholder {
+  color: rgba(255, 255, 255, 0.15);;
+}
+
+input:focus {
+  border-color: var(--color-accent) !important;
+  box-shadow: 0 0 0 4px rgba(0, 200, 140, 0.15);
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+.spin {
+  animation: spin 1s linear infinite;
+}
