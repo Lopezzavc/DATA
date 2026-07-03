@@ -1,6 +1,6 @@
 import { useEffect, useState, useRef, useCallback } from 'react'
 import {
-  Calendar, Loader2, Save, Edit3, X, Play, Pause, Square, RotateCcw, Zap, Trophy
+  Loader2, Save, Edit3, X, Play, Pause, Square, RotateCcw, Zap, Trophy
 } from 'lucide-react'
 import { supabase } from '../../lib/supabase'
 import { useTorneo } from '../../context/TorneoContext'
@@ -128,7 +128,7 @@ export default function Eliminatorias() {
   const [golesVisitanteVivo, setGolesVisitanteVivo] = useState(0)
   const [estadoVivo, setEstadoVivo] = useState('pendiente')
   const [segundos, setSegundos] = useState(0)
-  const [jugando, setJugando] = useState(false)
+  const [, setJugando] = useState(false)
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const [golesPartido, setGolesPartido] = useState<Gol[]>([])

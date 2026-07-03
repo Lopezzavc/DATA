@@ -111,7 +111,7 @@ export default function Public() {
   const [jornadas, setJornadas] = useState<Jornada[]>([])
   const [partidosGrupos, setPartidosGrupos] = useState<Partido[]>([])
   const [partidosEliminatorios, setPartidosEliminatorios] = useState<Partido[]>([])
-  const [goles, setGoles] = useState<Gol[]>([])
+  const [, setGoles] = useState<Gol[]>([])
   const [powerupsUsage, setPowerupsUsage] = useState<EquipoPowerups[]>([])
   const [loading, setLoading] = useState(true)
   const [dropdownOpen, setDropdownOpen] = useState(false)
