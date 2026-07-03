@@ -168,7 +168,7 @@ export default function PartidosGrupo() {
   const [golesVisitanteVivo, setGolesVisitanteVivo] = useState(0)
   const [estadoVivo, setEstadoVivo] = useState('pendiente')
   const [segundos, setSegundos] = useState(0)
-  const [jugando, setJugando] = useState(false)
+  const [, setJugando] = useState(false)
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   // Goles registrados en el partido en vivo
