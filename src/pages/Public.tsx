@@ -828,8 +828,8 @@ export default function Public() {
                             <div style={{ padding: '16px 0' }}>
                               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 12 }}>
                                 <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 16 }}>
-                                  <div className="match-pu-badges" style={{ display: 'flex', gap: 4 }}>
-                                    {(detail.powerups[detail.partido.equipo_local_id] || []).slice(0, 3).map(pu => (
+                                  <div className="match-pu-badges" style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                                    {(detail.powerups[detail.partido.equipo_local_id] || []).map(pu => (
                                       <div key={pu.powerupId} className="pu-badge" style={{ display: 'flex', alignItems: 'center', gap: 2, background: 'rgba(0,200,140,0.1)', borderRadius: 6, padding: '2px 6px', border: '1px solid var(--color-accent)' }}>
                                         <img src={POWERUP_IMAGES[pu.nombre] || ''} style={{ width: 16, height: 16, objectFit: 'contain' }} />
                                         <span style={{ fontSize: 12, color: 'var(--color-accent)' }}>{pu.cantidad}</span>
@@ -853,8 +853,8 @@ export default function Public() {
                                     ? <img src={visitante.escudo_url} className="escudo" style={{ width: 32, height: 32, objectFit: 'contain' }} />
                                     : <div className="escudo" style={{ width: 32, height: 32, borderRadius: 6, background: 'var(--color-border)' }} />
                                   }
-                                  <div className="match-pu-badges" style={{ display: 'flex', gap: 4 }}>
-                                    {(detail.powerups[detail.partido.equipo_visitante_id] || []).slice(0, 3).map(pu => (
+                                  <div className="match-pu-badges" style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                                    {(detail.powerups[detail.partido.equipo_visitante_id] || []).map(pu => (
                                       <div key={pu.powerupId} className="pu-badge" style={{ display: 'flex', alignItems: 'center', gap: 2, background: 'rgba(0,200,140,0.1)', borderRadius: 6, padding: '2px 6px', border: '1px solid var(--color-accent)' }}>
                                         <img src={POWERUP_IMAGES[pu.nombre] || ''} style={{ width: 16, height: 16, objectFit: 'contain' }} />
                                         <span style={{ fontSize: 12, color: 'var(--color-accent)' }}>{pu.cantidad}</span>
