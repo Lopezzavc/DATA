@@ -6,8 +6,9 @@ export interface Torneo {
   numero: number
   nombre: string | null
   activo: boolean
-  estado: 'en_curso' | 'finalizado'
+  estado: 'en_curso' | 'terminado' | 'lost_media'
   created_at: string
+  orden: number | null
 }
 
 interface TorneoContextType {
@@ -20,6 +21,17 @@ interface TorneoContextType {
 
 const TorneoContext = createContext<TorneoContextType | null>(null)
 
+function ordenarTorneos(lista: Torneo[]): Torneo[] {
+  return [...lista].sort((a, b) => {
+    const oa = a.orden
+    const ob = b.orden
+    if (oa != null && ob != null) return oa - ob
+    if (oa != null) return -1
+    if (ob != null) return 1
+    return b.numero - a.numero
+  })
+}
+
 export function TorneoProvider({ children }: { children: React.ReactNode }) {
   const [torneos, setTorneos] = useState<Torneo[]>([])
   const [torneoSeleccionado, setTorneoSeleccionado] = useState<Torneo | null>(null)
@@ -31,9 +43,10 @@ export function TorneoProvider({ children }: { children: React.ReactNode }) {
       .select('*')
       .order('numero', { ascending: false })
     if (data) {
-      setTorneos(data)
+      const ordenados = ordenarTorneos(data as Torneo[])
+      setTorneos(ordenados)
       if (!torneoSeleccionado) {
-        const activo = data.find(t => t.activo) ?? data[0]
+        const activo = ordenados.find(t => t.activo) ?? ordenados[0]
         if (activo) setTorneoSeleccionado(activo)
       }
     }

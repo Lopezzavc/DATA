@@ -6,9 +6,22 @@ export interface Torneo {
   id: string
   numero: number
   nombre: string | null
+  edicion: string | null
   activo: boolean
-  estado: 'en_curso' | 'finalizado'
+  estado: 'en_curso' | 'terminado' | 'lost_media'
   created_at: string
+  orden: number | null
+}
+
+function ordenarTorneos(lista: Torneo[]): Torneo[] {
+  return [...lista].sort((a, b) => {
+    const oa = a.orden
+    const ob = b.orden
+    if (oa != null && ob != null) return oa - ob
+    if (oa != null) return -1
+    if (ob != null) return 1
+    return b.numero - a.numero
+  })
 }
 
 export function useTorneoActivo() {
@@ -22,8 +35,9 @@ export function useTorneoActivo() {
         .select('*')
         .order('numero', { ascending: false })
       if (data) {
-        setTorneos(data)
-        const activo = data.find(t => t.activo) ?? data[0]
+        const ordenados = ordenarTorneos(data)
+        setTorneos(ordenados)
+        const activo = ordenados.find(t => t.activo) ?? ordenados[0]
         if (activo) setTorneoActivo(activo)
       }
     }

@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react'
-import { Trophy, Plus, Loader2, Pencil, X, Save, Trash2, Check } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
+import { Trophy, Plus, Loader2, Pencil, X, Save, Trash2, Check, GripVertical } from 'lucide-react'
 import { supabase } from '../../lib/supabase'
 import { useTorneo } from '../../context/TorneoContext'
 
@@ -9,8 +9,21 @@ interface Torneo {
   nombre: string | null
   edicion: string | null
   activo: boolean
-  estado: 'en_curso' | 'finalizado'
+  estado: 'en_curso' | 'terminado' | 'lost_media'
   created_at: string
+  orden: number | null
+}
+
+const ESTADO_LABELS: Record<Torneo['estado'], string> = {
+  en_curso: 'En curso',
+  terminado: 'Terminado',
+  lost_media: 'Lost media',
+}
+
+const ESTADO_COLORS: Record<Torneo['estado'], { bg: string; border: string; text: string }> = {
+  en_curso: { bg: 'rgba(0,200,140,0.12)', border: 'rgba(0,200,140,0.3)', text: 'var(--color-accent)' },
+  terminado: { bg: 'rgba(120,120,120,0.15)', border: 'rgba(180,180,180,0.3)', text: 'rgba(255,255,255,0.7)' },
+  lost_media: { bg: 'rgba(220,50,50,0.12)', border: 'rgba(220,50,50,0.35)', text: 'var(--color-error)' },
 }
 
 interface Equipo {
@@ -72,6 +85,18 @@ const INPUT: React.CSSProperties = {
   boxSizing: 'border-box',
 }
 
+// Ordena por el campo `orden` (si existe) y usa `numero` desc como fallback/desempate
+function ordenarTorneos(lista: Torneo[]): Torneo[] {
+  return [...lista].sort((a, b) => {
+    const oa = a.orden
+    const ob = b.orden
+    if (oa != null && ob != null) return oa - ob
+    if (oa != null) return -1
+    if (ob != null) return 1
+    return b.numero - a.numero
+  })
+}
+
 export default function Torneos() {
   const [torneos, setTorneos] = useState<Torneo[]>([])
   const [equipos, setEquipos] = useState<Equipo[]>([])
@@ -81,14 +106,20 @@ export default function Torneos() {
   const [modal, setModal] = useState<ModalState | null>(null)
   const [eliminando, setEliminando] = useState<Torneo | null>(null)
   const [confirmando, setConfirmando] = useState(false)
+  const [estadoDropdownId, setEstadoDropdownId] = useState<string | null>(null)
   const { setTorneoSeleccionado, refreshTorneos } = useTorneo()
+
+  // --- Drag and drop state ---
+  const [draggingId, setDraggingId] = useState<string | null>(null)
+  const [dragOverId, setDragOverId] = useState<string | null>(null)
+  const guardandoOrdenRef = useRef(false)
 
   const fetchTorneos = async () => {
     const { data } = await supabase
       .from('torneos')
       .select('*')
       .order('numero', { ascending: false })
-    if (data) setTorneos(data as Torneo[])
+    if (data) setTorneos(ordenarTorneos(data as Torneo[]))
     setLoading(false)
   }
 
@@ -198,6 +229,69 @@ export default function Torneos() {
     setEliminando(null)
   }
 
+  const cambiarEstado = async (torneo: Torneo, nuevoEstado: Torneo['estado']) => {
+    setTorneos(prev => prev.map(t => t.id === torneo.id ? { ...t, estado: nuevoEstado } : t))
+    await supabase.from('torneos').update({ estado: nuevoEstado }).eq('id', torneo.id)
+    await refreshTorneos()
+  }
+
+  // --- Persistencia del nuevo orden en Supabase ---
+  const persistirOrden = async (lista: Torneo[]) => {
+    if (guardandoOrdenRef.current) return
+    guardandoOrdenRef.current = true
+    try {
+      // Actualiza el campo `orden` de cada torneo según su posición actual
+      await Promise.all(
+        lista.map((t, index) =>
+          supabase.from('torneos').update({ orden: index }).eq('id', t.id)
+        )
+      )
+      await refreshTorneos()
+    } finally {
+      guardandoOrdenRef.current = false
+    }
+  }
+
+  // --- Handlers de drag and drop ---
+  const handleDragStart = (id: string) => (e: React.DragEvent) => {
+    setDraggingId(id)
+    e.dataTransfer.effectAllowed = 'move'
+    // Necesario en algunos navegadores para habilitar el drag
+    try {
+      e.dataTransfer.setData('text/plain', id)
+    } catch {
+      // no-op
+    }
+  }
+
+  const handleDragOver = (id: string) => (e: React.DragEvent) => {
+    e.preventDefault()
+    e.dataTransfer.dropEffect = 'move'
+    if (id !== dragOverId) setDragOverId(id)
+
+    if (!draggingId || draggingId === id) return
+
+    setTorneos(prev => {
+      const fromIndex = prev.findIndex(t => t.id === draggingId)
+      const toIndex = prev.findIndex(t => t.id === id)
+      if (fromIndex === -1 || toIndex === -1 || fromIndex === toIndex) return prev
+      const actualizado = [...prev]
+      const [movido] = actualizado.splice(fromIndex, 1)
+      actualizado.splice(toIndex, 0, movido)
+      return actualizado
+    })
+  }
+
+  const handleDragEnd = () => {
+    setDraggingId(null)
+    setDragOverId(null)
+    persistirOrden(torneos)
+  }
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault()
+  }
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '24px' }}>
 
@@ -240,64 +334,142 @@ export default function Torneos() {
         </div>
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-          {torneos.map(torneo => (
-            <div
-              key={torneo.id}
-              style={{
-                display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                padding: '14px 14px', borderRadius: '12px',
-                background: 'var(--color-background)',
-                border: '2px solid var(--color-border)',
-                transition: 'all 0.2s',
-              }}
-            >
-              <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
-                <div style={{
-                  width: '40px', height: '40px', borderRadius: '8px',
-                  background: 'var(--color-border)',
-                  display: 'flex', alignItems: 'center', justifyContent: 'center',
-                }}>
-                  <Trophy size={18} strokeWidth={2} color="var(--color-accent)" />
+          {torneos.length > 1 && (
+            <p style={{ fontSize: '12px', color: 'rgba(255,255,255,0.35)', margin: '0 0 4px 4px' }}>
+              Arrastra usando el ícono <GripVertical size={11} style={{ verticalAlign: 'middle' }} /> para reordenar los torneos.
+            </p>
+          )}
+          {torneos.map(torneo => {
+            const isDragging = draggingId === torneo.id
+            const isDragOver = dragOverId === torneo.id && draggingId !== torneo.id
+            return (
+              <div
+                key={torneo.id}
+                draggable
+                onDragStart={handleDragStart(torneo.id)}
+                onDragOver={handleDragOver(torneo.id)}
+                onDrop={handleDrop}
+                onDragEnd={handleDragEnd}
+                style={{
+                  display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                  padding: '14px 14px', borderRadius: '12px',
+                  background: 'var(--color-background)',
+                  border: `2px solid ${isDragOver ? 'var(--color-accent)' : 'var(--color-border)'}`,
+                  transition: 'border-color 0.15s, opacity 0.15s, transform 0.15s',
+                  opacity: isDragging ? 0.5 : 1,
+                  cursor: 'default',
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
+                  <div
+                    title="Arrastrar para reordenar"
+                    style={{
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      width: '20px', height: '40px',
+                      color: 'rgba(255,255,255,0.3)',
+                      cursor: 'grab',
+                      touchAction: 'none',
+                    }}
+                  >
+                    <GripVertical size={16} />
+                  </div>
+                  <div style={{
+                    width: '40px', height: '40px', borderRadius: '8px',
+                    background: 'var(--color-border)',
+                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  }}>
+                    <Trophy size={18} strokeWidth={2} color="var(--color-accent)" />
+                  </div>
+                  <div>
+                    <p style={{ fontWeight: '700', fontSize: '15px', color: 'var(--color-textWH)', margin: 0 }}>
+                      {[torneo.edicion, torneo.nombre].filter(Boolean).join(' ') || `Torneo ${torneo.numero}`}
+                    </p>
+                    <p style={{ fontSize: '12px', color: 'var(--color-accent)', marginTop: '2px', marginBottom: 0 }}>
+                      {new Date(torneo.created_at).toLocaleDateString('es-CO', { year: 'numeric', month: 'long', day: 'numeric' })}
+                    </p>
+                  </div>
                 </div>
-                <div>
-                  <p style={{ fontWeight: '700', fontSize: '15px', color: 'var(--color-textWH)', margin: 0 }}>
-                    {torneo.edicion || torneo.nombre || `Torneo ${torneo.numero}`}
-                  </p>
-                  <p style={{ fontSize: '12px', color: 'var(--color-accent)', marginTop: '2px', marginBottom: 0 }}>
-                    {new Date(torneo.created_at).toLocaleDateString('es-CO', { year: 'numeric', month: 'long', day: 'numeric' })}
-                  </p>
-                </div>
-              </div>
 
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                <button
-                  onClick={() => setEliminando(torneo)}
-                  title="Eliminar torneo"
-                  style={{
-                    display: 'flex', alignItems: 'center', justifyContent: 'center',
-                    width: '34px', height: '34px', borderRadius: '8px',
-                    background: 'rgba(220,50,50,0.2)',
-                    border: '1px solid rgba(220,50,50,0.7)',
-                    color: 'var(--color-error)', cursor: 'pointer',
-                  }}
-                >
-                  <Trash2 size={15} />
-                </button>
-                <button
-                  onClick={() => abrirModal(torneo)}
-                  title="Editar torneo"
-                  style={{
-                    display: 'flex', alignItems: 'center', justifyContent: 'center',
-                    width: '34px', height: '34px', borderRadius: '8px',
-                    background: 'var(--color-border)', border: '1px solid transparent',
-                    color: 'rgba(255,255,255,1)', cursor: 'pointer',
-                  }}
-                >
-                  <Pencil size={15} strokeWidth={3} />
-                </button>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <div style={{ position: 'relative' }}>
+                    <button
+                      onClick={() => setEstadoDropdownId(estadoDropdownId === torneo.id ? null : torneo.id)}
+                      style={{
+                        display: 'flex', alignItems: 'center', gap: '6px',
+                        padding: '7px 12px', borderRadius: '20px',
+                        background: ESTADO_COLORS[torneo.estado].bg,
+                        border: `1px solid ${ESTADO_COLORS[torneo.estado].border}`,
+                        color: ESTADO_COLORS[torneo.estado].text,
+                        fontSize: '12px', fontWeight: '700', cursor: 'pointer',
+                        whiteSpace: 'nowrap',
+                      }}
+                    >
+                      {ESTADO_LABELS[torneo.estado]}
+                    </button>
+                    {estadoDropdownId === torneo.id && (
+                      <>
+                        <div
+                          style={{ position: 'fixed', inset: 0, zIndex: 40 }}
+                          onClick={() => setEstadoDropdownId(null)}
+                        />
+                        <div style={{
+                          position: 'absolute', top: 'calc(100% + 6px)', right: 0,
+                          background: 'var(--color-bgdark)', border: '1px solid var(--color-border)',
+                          borderRadius: '10px', overflow: 'hidden', zIndex: 50,
+                          minWidth: '150px', boxShadow: '0 10px 30px rgba(0,0,0,0.5)',
+                        }}>
+                          {(Object.keys(ESTADO_LABELS) as Torneo['estado'][]).map(estado => (
+                            <button
+                              key={estado}
+                              onClick={() => { cambiarEstado(torneo, estado); setEstadoDropdownId(null) }}
+                              style={{
+                                width: '100%', display: 'flex', alignItems: 'center', gap: '8px',
+                                padding: '10px 14px',
+                                background: estado === torneo.estado ? 'rgba(255,255,255,0.06)' : 'transparent',
+                                border: 'none', color: ESTADO_COLORS[estado].text,
+                                fontSize: '13px', fontWeight: '600', cursor: 'pointer', textAlign: 'left',
+                              }}
+                            >
+                              <span style={{
+                                width: '8px', height: '8px', borderRadius: '50%',
+                                background: ESTADO_COLORS[estado].text, flexShrink: 0,
+                              }} />
+                              {ESTADO_LABELS[estado]}
+                            </button>
+                          ))}
+                        </div>
+                      </>
+                    )}
+                  </div>
+                  <button
+                    onClick={() => setEliminando(torneo)}
+                    title="Eliminar torneo"
+                    style={{
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      width: '34px', height: '34px', borderRadius: '8px',
+                      background: 'rgba(220,50,50,0.2)',
+                      border: '1px solid rgba(220,50,50,0.7)',
+                      color: 'var(--color-error)', cursor: 'pointer',
+                    }}
+                  >
+                    <Trash2 size={15} />
+                  </button>
+                  <button
+                    onClick={() => abrirModal(torneo)}
+                    title="Editar torneo"
+                    style={{
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      width: '34px', height: '34px', borderRadius: '8px',
+                      background: 'var(--color-border)', border: '1px solid transparent',
+                      color: 'rgba(255,255,255,1)', cursor: 'pointer',
+                    }}
+                  >
+                    <Pencil size={15} strokeWidth={3} />
+                  </button>
+                </div>
               </div>
-            </div>
-          ))}
+            )
+          })}
         </div>
       )}
 
@@ -314,7 +486,7 @@ export default function Torneos() {
             <p style={{ fontSize: '14px', color: 'rgba(255,255,255,0.5)', margin: 0 }}>
               ¿Estás seguro de que deseas eliminar{' '}
               <strong style={{ color: 'var(--color-textWH)' }}>
-                {eliminando.edicion || eliminando.nombre || `Torneo ${eliminando.numero}`}
+                {[eliminando.edicion, eliminando.nombre].filter(Boolean).join(' ') || `Torneo ${eliminando.numero}`}
               </strong>? Esta acción no se puede deshacer.
             </p>
             <div style={{ display: 'flex', gap: '8px' }}>

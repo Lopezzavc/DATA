@@ -39,6 +39,8 @@ interface Partido {
   grupo_eliminatorio?: number | null
   created_at?: string
   jornada_id?: string | null
+  torneo_id?: string
+  fase?: string
 }
 
 interface Jornada {
@@ -88,6 +90,18 @@ const POWERUP_IMAGES: Record<string, string> = {
   'Move Player': movePlayer,
 }
 
+const ESTADO_LABELS: Record<Torneo['estado'], string> = {
+  en_curso: 'En curso',
+  terminado: 'Terminado',
+  lost_media: 'Lost media',
+}
+
+const ESTADO_COLORS: Record<Torneo['estado'], string> = {
+  en_curso: '#FFC800',
+  terminado: '#00C88C',
+  lost_media: '#FF4D4D',
+}
+
 function darkenHex(hex: string, factor: number): string {
   const r = parseInt(hex.slice(1, 3), 16)
   const g = parseInt(hex.slice(3, 5), 16)
@@ -102,6 +116,39 @@ function formatearDuracion(segundos: number) {
   const mins = Math.floor(segundos / 60)
   const secs = segundos % 60
   return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`
+}
+
+// Interpola un color según un porcentaje (0-100): rojo -> naranja -> amarillo -> verde -> azul.
+// Pensado para contrastar sobre fondos oscuros.
+function colorPorPorcentaje(pct: number): string {
+  const stops: [number, [number, number, number]][] = [
+    [0, [255, 77, 77]],     // rojo
+    [25, [255, 150, 60]],   // naranja
+    [50, [255, 220, 70]],   // amarillo
+    [75, [110, 220, 120]],  // verde
+    [100, [80, 160, 255]],  // azul
+  ]
+  const clamped = Math.max(0, Math.min(100, pct))
+  let lower = stops[0]
+  let upper = stops[stops.length - 1]
+  for (let i = 0; i < stops.length - 1; i++) {
+    if (clamped >= stops[i][0] && clamped <= stops[i + 1][0]) {
+      lower = stops[i]
+      upper = stops[i + 1]
+      break
+    }
+  }
+  const range = upper[0] - lower[0]
+  const t = range === 0 ? 0 : (clamped - lower[0]) / range
+  const r = Math.round(lower[1][0] + (upper[1][0] - lower[1][0]) * t)
+  const g = Math.round(lower[1][1] + (upper[1][1] - lower[1][1]) * t)
+  const b = Math.round(lower[1][2] + (upper[1][2] - lower[1][2]) * t)
+  return `rgb(${r}, ${g}, ${b})`
+}
+
+// Genera una clave única y estable para un par de equipos, sin importar el orden
+function h2hKey(equipoAId: string, equipoBId: string) {
+  return [equipoAId, equipoBId].sort().join('__')
 }
 
 // ─── Componente principal ───
@@ -121,10 +168,48 @@ export default function Public() {
   const [teamMatches, setTeamMatches] = useState<MatchDetail[]>([])
   const [realtimeUpdating, setRealtimeUpdating] = useState(false)
 
+  // ─── Historial head-to-head (todos los enfrentamientos históricos entre dos equipos,
+  // sin importar el torneo). Se cachea por par de equipos para no volver a pedirlo. ───
+  const [h2hCache, setH2hCache] = useState<Record<string, Partido[]>>({})
+  const [loadingH2h, setLoadingH2h] = useState(false)
+
+  // ─── Ganadores por torneo (equipo campeón, calculado desde el partido de ronda "final") ───
+  const [ganadoresTorneo, setGanadoresTorneo] = useState<Record<string, Equipo | null>>({})
+
+  // ─── Mapa de torneos (id -> datos básicos) para resolver la edición de cada
+  // partido del historial head-to-head, sin importar de qué torneo provenga. ───
+  const [torneosMap, setTorneosMap] = useState<Record<string, { edicion: string | null; nombre: string | null; numero: number }>>({})
+
+  useEffect(() => {
+    if (!torneos || torneos.length === 0) return
+    const map: Record<string, { edicion: string | null; nombre: string | null; numero: number }> = {}
+    torneos.forEach(t => {
+      map[t.id] = { edicion: t.edicion ?? null, nombre: t.nombre ?? null, numero: t.numero }
+    })
+    setTorneosMap(map)
+  }, [torneos])
+
+  // Devuelve la etiqueta de edición para un torneo dado (fallback a "Torneo N" si no tiene edición)
+  const edicionLabel = useCallback((torneoId?: string | null) => {
+    if (!torneoId) return null
+    const t = torneosMap[torneoId]
+    if (!t) return null
+    return t.edicion || `Torneo ${t.numero}`
+  }, [torneosMap])
+
+  // Devuelve la letra + color que representa la fase/ronda de un partido:
+  // "G" grupos (gris), "E" eliminatoria (rojo), "F" final (amarillo)
+  const faseInfo = useCallback((partido: Partido): { letra: string; color: string } | null => {
+    if (partido.ronda === 'final') return { letra: 'F', color: '#FFC800' }
+    if (partido.fase === 'eliminatorias') return { letra: 'E', color: '#FF4D4D' }
+    if (partido.fase === 'grupos') return { letra: 'G', color: 'rgba(255,255,255,0.5)' }
+    return null
+  }, [])
+
   // ─── Título dinámico de la página (pestaña del navegador) ───
   useEffect(() => {
-    const nombre = torneoActivo?.nombre || (torneoActivo ? `Torneo ${torneoActivo.numero}` : '')
-    document.title = `Copa DISCORD${nombre ? ` - ${nombre}` : ''}`
+    const etiqueta = torneoActivo?.edicion || (torneoActivo ? `Torneo ${torneoActivo.numero}` : '')
+    document.title = `Copa DISCORD${etiqueta ? ` - ${etiqueta}` : ''}`
   }, [torneoActivo])
 
   const cargarDatos = useCallback(async (torneo: Torneo, isRealtimeUpdate = false) => {
@@ -188,6 +273,13 @@ export default function Public() {
       const todosPartidos = [...(partidosGruposData || []), ...eliminatoriosJugados]
       const partidosIds = todosPartidos.map(p => p.id)
 
+      // ─── Power-ups: se calculan sobre TODOS los partidos de fase de grupos
+      // (jugados o no) para que el total coincida siempre con ClasificatoriaGrupos.tsx,
+      // que toma como base todos los partidos de la fase de grupos del torneo. ───
+      const { data: partidosGrupoTodos } = await supabase
+        .from('partidos').select('id').eq('torneo_id', torneo.id).eq('fase', 'grupos')
+      const partidosGrupoIds = (partidosGrupoTodos || []).map(p => p.id)
+
       if (partidosIds.length > 0) {
         const { data: golesData } = await supabase
           .from('goles').select('*').in('partido_id', partidosIds).order('minuto', { ascending: true })
@@ -220,11 +312,24 @@ export default function Public() {
           return db - da
         })
         setTeamMatches(matchesConPowerups)
+      } else {
+        setGoles([])
+        setTeamMatches([])
+      }
 
-        if (equiposList.length > 0) {
+      // ─── Uso de power-ups por equipo (independiente de si hay partidos jugados,
+      // igual que en ClasificatoriaGrupos.tsx: se basa en TODOS los partidos de
+      // fase de grupos del torneo, no solo los ya finalizados). ───
+      if (equiposList.length > 0) {
+        if (partidosGrupoIds.length > 0) {
+          const { data: puUsadosGrupo } = await supabase
+            .from('powerups_usados').select('equipo_id, powerup_id, cantidad')
+            .in('partido_id', partidosGrupoIds)
+          const { data: catalogoGrupo } = await supabase.from('powerups_catalogo').select('id, nombre')
+
           const equipoPowerMap: Record<string, Record<string, number>> = {}
           equiposList.forEach(eq => { equipoPowerMap[eq.id] = {} })
-          puUsados?.forEach(pu => {
+          puUsadosGrupo?.forEach(pu => {
             if (equipoPowerMap[pu.equipo_id]) {
               equipoPowerMap[pu.equipo_id][pu.powerup_id] = (equipoPowerMap[pu.equipo_id][pu.powerup_id] || 0) + pu.cantidad
             }
@@ -234,7 +339,7 @@ export default function Public() {
             const info: PowerupInfo[] = []
             let total = 0
             Object.entries(powers).forEach(([powerupId, cantidad]) => {
-              const cat = catalogo?.find(c => c.id === powerupId)
+              const cat = catalogoGrupo?.find(c => c.id === powerupId)
               if (cat) {
                 info.push({ powerupId, nombre: cat.nombre, cantidad })
                 total += cantidad
@@ -245,10 +350,10 @@ export default function Public() {
           })
           usage.sort((a, b) => b.total - a.total)
           setPowerupsUsage(usage)
+        } else {
+          setPowerupsUsage(equiposList.map(eq => ({ equipo: eq, powerups: [], total: 0 })))
         }
       } else {
-        setGoles([])
-        setTeamMatches([])
         setPowerupsUsage([])
       }
     } catch (error) {
@@ -262,6 +367,71 @@ export default function Public() {
   useEffect(() => {
     if (torneoActivo) cargarDatos(torneoActivo)
   }, [torneoActivo, cargarDatos])
+
+  // ─── Cargar el equipo ganador (campeón) de CADA torneo, para mostrarlo
+  // junto al nombre en el botón del dropdown y en la lista desplegable.
+  // El ganador se determina a partir del partido de ronda === 'final'. ───
+  useEffect(() => {
+    if (!torneos || torneos.length === 0) return
+
+    let cancelado = false
+
+    const cargarGanadores = async () => {
+      try {
+        const torneoIds = torneos.map(t => t.id)
+
+        // Traemos todos los partidos de "final" (jugados o no) de todos los torneos
+        const { data: finales } = await supabase
+          .from('partidos')
+          .select('torneo_id, equipo_local_id, equipo_visitante_id, goles_local, goles_visitante')
+          .in('torneo_id', torneoIds)
+          .eq('fase', 'eliminatorias')
+          .eq('ronda', 'final')
+
+        if (!finales || finales.length === 0) {
+          if (!cancelado) setGanadoresTorneo({})
+          return
+        }
+
+        // Determinamos el id del equipo ganador para cada torneo
+        const ganadorIdPorTorneo: Record<string, string | null> = {}
+        finales.forEach(f => {
+          if (f.goles_local == null || f.goles_visitante == null) return
+          if (f.goles_local === f.goles_visitante) return
+          ganadorIdPorTorneo[f.torneo_id] = f.goles_local > f.goles_visitante
+            ? f.equipo_local_id
+            : f.equipo_visitante_id
+        })
+
+        const equipoIdsGanadores = Array.from(new Set(Object.values(ganadorIdPorTorneo).filter(Boolean))) as string[]
+        if (equipoIdsGanadores.length === 0) {
+          if (!cancelado) setGanadoresTorneo({})
+          return
+        }
+
+        const { data: equiposGanadores } = await supabase
+          .from('equipos')
+          .select('id, nombre, escudo_url, color_hex')
+          .in('id', equipoIdsGanadores)
+
+        const mapaEquipos: Record<string, Equipo> = {}
+        equiposGanadores?.forEach(eq => { mapaEquipos[eq.id] = eq as Equipo })
+
+        const resultado: Record<string, Equipo | null> = {}
+        Object.entries(ganadorIdPorTorneo).forEach(([torneoId, equipoId]) => {
+          resultado[torneoId] = equipoId ? (mapaEquipos[equipoId] ?? null) : null
+        })
+
+        if (!cancelado) setGanadoresTorneo(resultado)
+      } catch (error) {
+        console.error('Error cargando ganadores de torneos:', error)
+      }
+    }
+
+    cargarGanadores()
+
+    return () => { cancelado = true }
+  }, [torneos])
 
   // ─── Suscripción a cambios en tiempo real ───
   useEffect(() => {
@@ -317,9 +487,70 @@ export default function Public() {
     fetchGoals()
   }, [expandedMatchId])
 
+  // ─── Cargar historial head-to-head entre los dos equipos del partido expandido.
+  // Se busca en TODOS los torneos (incluido el activo) y en ambas fases
+  // (grupos + eliminatorias), sin importar quién fue local o visitante. ───
+  useEffect(() => {
+    if (!expandedMatchId) return
+    const detalle = teamMatches.find(m => m.partido.id === expandedMatchId)
+    if (!detalle) return
+
+    const { equipo_local_id, equipo_visitante_id } = detalle.partido
+    const key = h2hKey(equipo_local_id, equipo_visitante_id)
+
+    // Si ya está en caché, no volvemos a pedirlo
+    if (h2hCache[key]) return
+
+    let cancelado = false
+    setLoadingH2h(true)
+
+    const cargarH2h = async () => {
+      try {
+        const { data: comoLocal } = await supabase
+          .from('partidos')
+          .select('*')
+          .eq('equipo_local_id', equipo_local_id)
+          .eq('equipo_visitante_id', equipo_visitante_id)
+          .not('goles_local', 'is', null)
+          .not('goles_visitante', 'is', null)
+
+        const { data: comoVisitante } = await supabase
+          .from('partidos')
+          .select('*')
+          .eq('equipo_local_id', equipo_visitante_id)
+          .eq('equipo_visitante_id', equipo_local_id)
+          .not('goles_local', 'is', null)
+          .not('goles_visitante', 'is', null)
+
+        const todos = [...(comoLocal || []), ...(comoVisitante || [])] as Partido[]
+        todos.sort((a, b) => {
+          const da = a.fecha ? new Date(a.fecha).getTime() : (a.created_at ? new Date(a.created_at).getTime() : 0)
+          const db = b.fecha ? new Date(b.fecha).getTime() : (b.created_at ? new Date(b.created_at).getTime() : 0)
+          return db - da
+        })
+
+        if (!cancelado) {
+          setH2hCache(prev => ({ ...prev, [key]: todos }))
+        }
+      } catch (error) {
+        console.error('Error cargando historial head-to-head:', error)
+      } finally {
+        if (!cancelado) setLoadingH2h(false)
+      }
+    }
+
+    cargarH2h()
+
+    return () => { cancelado = true }
+  }, [expandedMatchId, teamMatches, h2hCache])
+
+  // ─── Tabla de clasificación ───
+  // IMPORTANTE: el criterio de orden debe ser IDÉNTICO al de ClasificatoriaGrupos.tsx
+  // (PTS -> DG -> GF -> menos power-ups usados -> nombre alfabético) para que el
+  // orden mostrado en la página pública coincida siempre con el panel de administración.
   const tabla = useMemo(() => {
-    const statsMap = new Map<string, { pj: number; pg: number; pe: number; pp: number; gf: number; gc: number; pts: number }>()
-    equipos.forEach(eq => statsMap.set(eq.id, { pj: 0, pg: 0, pe: 0, pp: 0, gf: 0, gc: 0, pts: 0 }))
+    const statsMap = new Map<string, { pj: number; pg: number; pe: number; pp: number; gf: number; gc: number; pts: number; powerupsUsados: number }>()
+    equipos.forEach(eq => statsMap.set(eq.id, { pj: 0, pg: 0, pe: 0, pp: 0, gf: 0, gc: 0, pts: 0, powerupsUsados: 0 }))
     partidosGrupos.forEach(p => {
       const local = statsMap.get(p.equipo_local_id)
       const visitante = statsMap.get(p.equipo_visitante_id)
@@ -331,12 +562,27 @@ export default function Public() {
       else if (p.goles_local < p.goles_visitante) { visitante.pg++; visitante.pts += 3; local.pp++ }
       else { local.pe++; visitante.pe++; local.pts += 1; visitante.pts += 1 }
     })
+
+    // Total de power-ups usados por equipo (mismo criterio de desempate que Clasificatoria)
+    powerupsUsage.forEach(ep => {
+      const stat = statsMap.get(ep.equipo.id)
+      if (stat) stat.powerupsUsados = ep.total
+    })
+
     return Array.from(statsMap.entries()).map(([id, stat]) => ({
       id, ...stat,
       dg: stat.gf - stat.gc,
       equipo: equipos.find(e => e.id === id)!,
-    })).sort((a, b) => b.pts - a.pts || b.dg - a.dg || b.gf - a.gf)
-  }, [equipos, partidosGrupos])
+    })).sort((a, b) => {
+      if (b.pts !== a.pts) return b.pts - a.pts
+      if (b.dg !== a.dg) return b.dg - a.dg
+      if (b.gf !== a.gf) return b.gf - a.gf
+      // Penúltimo criterio de desempate: menos power-ups usados clasifica mejor.
+      if (a.powerupsUsados !== b.powerupsUsados) return a.powerupsUsados - b.powerupsUsados
+      // Último criterio, determinista: orden alfabético (igual que en ClasificatoriaGrupos.tsx).
+      return (a.equipo?.nombre ?? '').localeCompare(b.equipo?.nombre ?? '')
+    })
+  }, [equipos, partidosGrupos, powerupsUsage])
 
   const equipoById = (id: string) => equipos.find(e => e.id === id)
 
@@ -366,8 +612,6 @@ export default function Public() {
         .match-card:hover { transform: translateY(-3px); box-shadow: 0 10px 28px rgba(0,0,0,0.35), 0 0 0 1px rgba(0,200,140,0.3); border-color: rgba(0,200,140,0.45) !important; }
         .side-bar { transition: width 0.22s ease; }
         .match-card:hover .side-bar { width: 14px !important; }
-        .score-display { transition: color 0.2s; }
-        .match-card:hover .score-display { color: var(--color-accent); }
         .pu-badge { transition: transform 0.18s; }
         .pu-badge:hover { transform: scale(1.15); z-index: 5; }
         .escudo { transition: transform 0.2s ease; }
@@ -382,6 +626,41 @@ export default function Public() {
         }
         .map-container.expanded {
           max-height: 700px;
+        }
+
+        .expanded-split {
+          display: flex;
+          align-items: stretch;
+          gap: 0;
+        }
+        .expanded-split-main {
+          flex: 0 0 60%;
+          max-width: 60%;
+        }
+        .expanded-split-h2h {
+          flex: 0 0 40%;
+          max-width: 40%;
+          border-left: 1px solid var(--color-border);
+        }
+        .h2h-scroll {
+          max-height: 340px;
+          overflow-y: auto;
+        }
+        .h2h-scroll::-webkit-scrollbar { width: 6px; }
+        .h2h-scroll::-webkit-scrollbar-thumb { background: var(--color-border); border-radius: 4px; }
+
+        @media (max-width: 768px) {
+          .expanded-split {
+            flex-direction: column !important;
+          }
+          .expanded-split-main, .expanded-split-h2h {
+            flex: unset !important;
+            max-width: 100% !important;
+          }
+          .expanded-split-h2h {
+            border-left: none !important;
+            border-top: 1px solid var(--color-border);
+          }
         }
 
         /* ── Desktop: jornadas en grid ── */
@@ -450,7 +729,7 @@ export default function Public() {
           }
           .tabla-scroll-wrapper::-webkit-scrollbar { display: none; }
           .tabla-inner {
-            min-width: 560px;
+            min-width: 620px;
           }
 
           /* ── Mobile: sección 2 (historial + powerups) → columna ── */
@@ -492,7 +771,7 @@ export default function Public() {
         {/* Header */}
         <div className="page-header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <h1 style={{ fontSize: '36px', fontWeight: '800', margin: 0 }}>
-            Copa DISCORD{torneoActivo ? ` - ${torneoActivo.nombre || `Torneo ${torneoActivo.numero}`}` : ''}
+            Copa DISCORD{torneoActivo ? ` - ${[torneoActivo.nombre, torneoActivo.edicion].filter(Boolean).join(' ') || `Torneo ${torneoActivo.numero}`}` : ''}
             {realtimeUpdating && (
               <span style={{ fontSize: '14px', marginLeft: '12px', color: 'var(--color-accent)', fontWeight: '400' }}>
                 <Loader2 size={14} className="spin" style={{ marginRight: '4px' }} />
@@ -503,19 +782,52 @@ export default function Public() {
           <div className="torneo-dropdown-wrapper" style={{ position: 'relative', width: '320px' }}>
             <button
               onClick={() => setDropdownOpen(!dropdownOpen)}
+              className="dropdown-btn"
               style={{
                 width: '100%', display: 'flex', alignItems: 'center', gap: '12px',
                 padding: '12px 18px', borderRadius: '12px',
-                background: 'var(--color-bgdark)', border: '2px solid var(--color-border)',
+                background: 'var(--color-background)', border: '2px solid var(--color-border)',
                 color: 'var(--color-textWH)', fontSize: '15px', fontWeight: '600',
                 cursor: 'pointer', justifyContent: 'space-between',
               }}
             >
               <div style={{ display: 'flex', alignItems: 'center', gap: '10px', overflow: 'hidden' }}>
                 <Trophy size={18} color="var(--color-accent)" />
+                {torneoActivo && (
+                  <span style={{
+                    width: '9px', height: '9px', borderRadius: '50%', flexShrink: 0,
+                    background: ESTADO_COLORS[torneoActivo.estado],
+                    boxShadow: `0 0 6px ${ESTADO_COLORS[torneoActivo.estado]}`,
+                  }} />
+                )}
                 <span style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                   {torneoActivo?.nombre || `Torneo ${torneoActivo?.numero}`}
                 </span>
+                {torneoActivo && ganadoresTorneo[torneoActivo.id] && (
+                  ganadoresTorneo[torneoActivo.id]!.escudo_url ? (
+                    <img
+                      src={ganadoresTorneo[torneoActivo.id]!.escudo_url!}
+                      alt={ganadoresTorneo[torneoActivo.id]!.nombre}
+                      title={`Campeón: ${ganadoresTorneo[torneoActivo.id]!.nombre}`}
+                      style={{ width: '20px', height: '20px', objectFit: 'contain', flexShrink: 0 }}
+                    />
+                  ) : (
+                    <div
+                      title={`Campeón: ${ganadoresTorneo[torneoActivo.id]!.nombre}`}
+                      style={{ width: '20px', height: '20px', borderRadius: '5px', background: 'var(--color-border)', flexShrink: 0 }}
+                    />
+                  )
+                )}
+                {torneoActivo && (
+                  <span style={{
+                    padding: '2px 8px', borderRadius: '20px', whiteSpace: 'nowrap',
+                    background: `${ESTADO_COLORS[torneoActivo.estado]}26`,
+                    border: `1px solid ${ESTADO_COLORS[torneoActivo.estado]}4D`,
+                    color: ESTADO_COLORS[torneoActivo.estado], fontSize: '11px', fontWeight: '700',
+                  }}>
+                    {ESTADO_LABELS[torneoActivo.estado]}
+                  </span>
+                )}
                 {torneoActivo?.activo && (
                   <span style={{ padding: '2px 8px', borderRadius: '20px', background: 'rgba(0,200,140,0.15)', border: '1px solid rgba(0,200,140,0.3)', color: 'var(--color-accent)', fontSize: '11px', fontWeight: '700', whiteSpace: 'nowrap' }}>
                     EN JUEGO
@@ -525,23 +837,49 @@ export default function Public() {
               <ChevronDown size={18} color="rgba(255,255,255,0.5)" style={{ transform: dropdownOpen ? 'rotate(180deg)' : 'none', transition: 'transform 0.2s' }} />
             </button>
             {dropdownOpen && (
-              <div style={{ position: 'absolute', top: 'calc(100% + 6px)', left: 0, right: 0, background: 'var(--color-bgdark)', border: '2px solid var(--color-border)', borderRadius: '12px', maxHeight: '300px', overflowY: 'auto', zIndex: 50, boxShadow: '0 10px 30px rgba(0,0,0,0.5)' }}>
-                {torneos.map(t => (
-                  <button
-                    key={t.id}
-                    className="dropdown-item"
-                    onClick={() => { setTorneoActivo(t); setDropdownOpen(false) }}
-                    style={{ width: '100%', display: 'flex', alignItems: 'center', gap: '10px', padding: '12px 18px', background: t.id === torneoActivo?.id ? 'rgba(0,200,140,0.08)' : 'transparent', border: 'none', color: 'var(--color-textWH)', fontSize: '14px', cursor: 'pointer', textAlign: 'left' }}
-                  >
-                    <Trophy size={15} color={t.id === torneoActivo?.id ? 'var(--color-accent)' : 'rgba(255,255,255,0.4)'} />
-                    <span style={{ flex: 1 }}>{t.nombre || `Torneo ${t.numero}`}</span>
-                    {t.activo && (
-                      <span style={{ padding: '2px 8px', borderRadius: '20px', background: 'rgba(0,200,140,0.15)', border: '1px solid rgba(0,200,140,0.3)', color: 'var(--color-accent)', fontSize: '10px', fontWeight: '700' }}>
-                        EN JUEGO
+              <div style={{ position: 'absolute', top: 'calc(100% + 6px)', left: 0, right: 0, background: 'var(--color-background)', border: '2px solid var(--color-border)', borderRadius: '12px', maxHeight: '300px', overflowY: 'auto', zIndex: 50, boxShadow: '0 10px 30px rgba(0,0,0,0.5)' }}>
+                {torneos.map(t => {
+                  const ganador = ganadoresTorneo[t.id]
+                  return (
+                    <button
+                      key={t.id}
+                      className="dropdown-item"
+                      onClick={() => { setTorneoActivo(t); setDropdownOpen(false) }}
+                      style={{ width: '100%', display: 'flex', alignItems: 'center', gap: '10px', padding: '12px 18px', background: t.id === torneoActivo?.id ? 'rgba(0,200,140,0.08)' : 'transparent', border: 'none', color: 'var(--color-textWH)', fontSize: '14px', cursor: 'pointer', textAlign: 'left' }}
+                    >
+                      <Trophy size={15} color={t.id === torneoActivo?.id ? 'var(--color-accent)' : 'rgba(255,255,255,0.4)'} />
+                      <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.nombre || `Torneo ${t.numero}`}</span>
+                      {ganador && (
+                        ganador.escudo_url ? (
+                          <img
+                            src={ganador.escudo_url}
+                            alt={ganador.nombre}
+                            title={`Campeón: ${ganador.nombre}`}
+                            style={{ width: '18px', height: '18px', objectFit: 'contain', flexShrink: 0 }}
+                          />
+                        ) : (
+                          <div
+                            title={`Campeón: ${ganador.nombre}`}
+                            style={{ width: '18px', height: '18px', borderRadius: '5px', background: 'var(--color-border)', flexShrink: 0 }}
+                          />
+                        )
+                      )}
+                      <span style={{
+                        padding: '2px 8px', borderRadius: '20px', whiteSpace: 'nowrap',
+                        background: `${ESTADO_COLORS[t.estado]}26`,
+                        border: `1px solid ${ESTADO_COLORS[t.estado]}4D`,
+                        color: ESTADO_COLORS[t.estado], fontSize: '10px', fontWeight: '700',
+                      }}>
+                        {ESTADO_LABELS[t.estado]}
                       </span>
-                    )}
-                  </button>
-                ))}
+                      {t.activo && (
+                        <span style={{ padding: '2px 8px', borderRadius: '20px', background: 'rgba(0,200,140,0.15)', border: '1px solid rgba(0,200,140,0.3)', color: 'var(--color-accent)', fontSize: '10px', fontWeight: '700' }}>
+                          EN JUEGO
+                        </span>
+                      )}
+                    </button>
+                  )
+                })}
               </div>
             )}
           </div>
@@ -686,7 +1024,7 @@ export default function Public() {
                   <div className="tabla-scroll-wrapper" style={{ borderRadius: '12px', overflow: 'hidden', border: '2px solid var(--color-border)', background: 'var(--color-background)', flex: 1, display: 'flex', flexDirection: 'column' }}>
                     <div className="tabla-inner" style={{
                       display: 'grid',
-                      gridTemplateColumns: '40px 1fr 40px 40px 50px 40px 40px 40px 40px 40px 50px',
+                      gridTemplateColumns: '40px 1fr 40px 40px 50px 40px 40px 40px 40px 40px 40px 50px',
                       padding: '12px 16px', background: 'rgba(0, 93, 67, 1)',
                       borderBottom: '1px solid var(--color-border)', fontSize: '12px',
                       fontWeight: '600', color: 'rgba(255,255,255,0.6)',
@@ -702,6 +1040,7 @@ export default function Public() {
                       <span style={{ textAlign: 'center' }}>GF</span>
                       <span style={{ textAlign: 'center' }}>GC</span>
                       <span style={{ textAlign: 'center' }}>DG</span>
+                      <span style={{ textAlign: 'center' }} title="Power-ups usados (desempate: menos usados clasifica mejor)">PU</span>
                       <span style={{ textAlign: 'center', fontWeight: '700', color: 'var(--color-accent)' }}>PTS</span>
                     </div>
                     <div style={{ flex: 1 }}>
@@ -714,7 +1053,7 @@ export default function Public() {
                             className="tabla-inner"
                             style={{
                               display: 'grid',
-                              gridTemplateColumns: '40px 1fr 40px 40px 50px 40px 40px 40px 40px 40px 50px',
+                              gridTemplateColumns: '40px 1fr 40px 40px 50px 40px 40px 40px 40px 40px 40px 50px',
                               padding: '12px 16px',
                               borderBottom: index < tabla.length - 1 ? '1px solid var(--color-border)' : 'none',
                               color: 'var(--color-textWH)', fontSize: '14px',
@@ -749,6 +1088,9 @@ export default function Public() {
                               color: stat.dg > 0 ? 'var(--color-accent)' : stat.dg < 0 ? 'var(--color-error)' : 'inherit',
                             }}>
                               {stat.dg > 0 ? `+${stat.dg}` : stat.dg}
+                            </span>
+                            <span style={{ textAlign: 'center', color: 'rgba(255,255,255,0.7)' }}>
+                              {stat.powerupsUsados}
                             </span>
                             <span style={{
                               textAlign: 'center', fontWeight: 800,
@@ -806,6 +1148,15 @@ export default function Public() {
                       const empate = golesLocal === golesVisitante
                       const isExpanded = expandedMatchId === detail.partido.id
 
+                      const key = h2hKey(detail.partido.equipo_local_id, detail.partido.equipo_visitante_id)
+                      // ─── FIX: `h2hTodos` incluye el partido actual (detail.partido) y se usa
+                      // para el RESUMEN de victorias/empates/derrotas y sus porcentajes, para que
+                      // el resultado de la card contenedora sí se tenga en cuenta en el conteo.
+                      // `h2hPartidos` excluye el partido actual y se usa solo para el LISTADO de
+                      // "otros enfrentamientos", ya que ese partido ya se muestra en la card misma. ───
+                      const h2hTodos = h2hCache[key] || []
+                      const h2hPartidos = h2hTodos.filter(p => p.id !== detail.partido.id)
+
                       return (
                         <div
                           key={detail.partido.id}
@@ -843,8 +1194,14 @@ export default function Public() {
                                   <span className="match-team-name" style={{ fontWeight: 600, whiteSpace: 'nowrap' }}>{local?.nombre}</span>
                                 </div>
 
-                                <div className="score-display match-score" style={{ fontSize: 24, fontWeight: 800, color: isExpanded ? 'var(--color-accent)' : 'var(--color-textWH)', whiteSpace: 'nowrap' }}>
-                                  {golesLocal} : {golesVisitante}
+                                <div className="score-display match-score" style={{ fontSize: 24, fontWeight: 800, whiteSpace: 'nowrap' }}>
+                                  <span style={{ color: empate ? 'var(--color-textWH)' : (localGano ? 'rgb(0, 200, 140)' : 'rgb(255, 77, 77)') }}>
+                                    {golesLocal}
+                                  </span>
+                                  <span style={{ color: 'var(--color-textWH)' }}> : </span>
+                                  <span style={{ color: empate ? 'var(--color-textWH)' : (visitanteGano ? 'rgb(0, 200, 140)' : 'rgb(255, 77, 77)') }}>
+                                    {golesVisitante}
+                                  </span>
                                 </div>
 
                                 <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 16 }}>
@@ -871,80 +1228,274 @@ export default function Public() {
                             </div>
 
                             <div className={`map-container ${isExpanded ? 'expanded' : ''}`}>
-                              <div style={{
+                              <div className="expanded-split" style={{
                                 borderTop: '1px solid var(--color-border)',
-                                padding: '10px 0 20px',
                               }}>
-                                {loadingMatchGoals && isExpanded ? (
-                                  <div style={{ display: 'flex', justifyContent: 'center', padding: '20px' }}>
-                                    <Loader2 size={24} className="spin" />
+                                {/* Columna 60%: contenido original (mapa de goles) */}
+                                <div className="expanded-split-main" style={{ padding: '10px 0 20px' }}>
+                                  {loadingMatchGoals && isExpanded ? (
+                                    <div style={{ display: 'flex', justifyContent: 'center', padding: '20px' }}>
+                                      <Loader2 size={24} className="spin" />
+                                    </div>
+                                  ) : (
+                                    <>
+                                      {expandedMatchGoals.filter(g => g.pos_x != null && g.pos_y != null).length > 0 ? (
+                                        <div className="gol-map-container" style={{
+                                          position: 'relative',
+                                          width: '96%',
+                                          margin: '0 auto',
+                                          aspectRatio: '16/9',
+                                          borderRadius: '8px',
+                                          overflow: 'hidden',
+                                          border: '0px solid var(--color-border)',
+                                        }}>
+                                          <img src={canchaImage} alt="" style={{
+                                            position: 'absolute', inset: 0,
+                                            width: '100%', height: '100%',
+                                            objectFit: 'cover', objectPosition: 'center',
+                                            zIndex: 1,
+                                          }} />
+                                          <div style={{
+                                            position: 'absolute', inset: 0, zIndex: 2, pointerEvents: 'none',
+                                            background: `linear-gradient(to right,
+                                              ${local?.color_hex || '#00C88C'} 0%, ${local?.color_hex || '#00C88C'} 6.58%,
+                                              transparent 6.58%, transparent 93.39%,
+                                              ${visitante?.color_hex || '#FF4D4D'} 93.39%, ${visitante?.color_hex || '#FF4D4D'} 100%)`,
+                                            mixBlendMode: 'multiply',
+                                            WebkitMaskImage: `url(${canchaImage})`,
+                                            maskImage: `url(${canchaImage})`,
+                                            WebkitMaskSize: 'cover',
+                                            maskSize: 'cover',
+                                            WebkitMaskPosition: 'center',
+                                            maskPosition: 'center',
+                                          }} />
+                                          {expandedMatchGoals.filter(g => g.pos_x != null && g.pos_y != null).map(gol => {
+                                            const color = equipoById(gol.equipo_id)?.color_hex || '#FF0000'
+                                            return (
+                                              <div key={gol.id} style={{
+                                                position: 'absolute',
+                                                left: `${gol.pos_x}%`,
+                                                top: `${gol.pos_y}%`,
+                                                width: '24px',
+                                                height: '24px',
+                                                borderRadius: '50%',
+                                                backgroundColor: darkenHex(color, 0.6),
+                                                border: `3px solid ${color}`,
+                                                transform: 'translate(-50%, -50%)',
+                                                boxShadow: `0 0 10px ${color}`,
+                                                zIndex: 5,
+                                                display: 'flex',
+                                                alignItems: 'center',
+                                                justifyContent: 'center',
+                                                color: '#fff',
+                                                fontSize: '10px',
+                                                fontWeight: 'bold',
+                                              }}>
+                                                {expandedMatchGoals.filter(g => g.equipo_id === gol.equipo_id && g.pos_x != null).indexOf(gol) + 1}
+                                              </div>
+                                            )
+                                          })}
+                                        </div>
+                                      ) : (
+                                        <div style={{ textAlign: 'center', color: 'rgba(255,255,255,0.3)', fontSize: '13px', padding: '16px' }}>
+                                          No hay goles con ubicación registrada
+                                        </div>
+                                      )}
+                                    </>
+                                  )}
+                                </div>
+
+                                {/* Columna 40%: historial head-to-head entre estos dos equipos */}
+                                <div className="expanded-split-h2h" style={{ padding: '10px 16px 20px' }}>
+                                  <div style={{ fontSize: 12, fontWeight: 700, color: 'rgba(255,255,255,0.5)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 10 }}>
+                                    Historial entre ambos
                                   </div>
-                                ) : (
-                                  <>
-                                    {expandedMatchGoals.filter(g => g.pos_x != null && g.pos_y != null).length > 0 ? (
-                                      <div className="gol-map-container" style={{
-                                        position: 'relative',
-                                        width: '60%',
-                                        margin: '0 auto',
-                                        aspectRatio: '16/9',
-                                        borderRadius: '8px',
-                                        overflow: 'hidden',
-                                        border: '0px solid var(--color-border)',
-                                      }}>
-                                        <img src={canchaImage} alt="" style={{
-                                          position: 'absolute', inset: 0,
-                                          width: '100%', height: '100%',
-                                          objectFit: 'cover', objectPosition: 'center',
-                                          zIndex: 1,
-                                        }} />
-                                        <div style={{
-                                          position: 'absolute', inset: 0, zIndex: 2, pointerEvents: 'none',
-                                          background: `linear-gradient(to right,
-                                            ${local?.color_hex || '#00C88C'} 0%, ${local?.color_hex || '#00C88C'} 6.58%,
-                                            transparent 6.58%, transparent 93.39%,
-                                            ${visitante?.color_hex || '#FF4D4D'} 93.39%, ${visitante?.color_hex || '#FF4D4D'} 100%)`,
-                                          mixBlendMode: 'multiply',
-                                          WebkitMaskImage: `url(${canchaImage})`,
-                                          maskImage: `url(${canchaImage})`,
-                                          WebkitMaskSize: 'cover',
-                                          maskSize: 'cover',
-                                          WebkitMaskPosition: 'center',
-                                          maskPosition: 'center',
-                                        }} />
-                                        {expandedMatchGoals.filter(g => g.pos_x != null && g.pos_y != null).map(gol => {
-                                          const color = equipoById(gol.equipo_id)?.color_hex || '#FF0000'
-                                          return (
-                                            <div key={gol.id} style={{
-                                              position: 'absolute',
-                                              left: `${gol.pos_x}%`,
-                                              top: `${gol.pos_y}%`,
-                                              width: '24px',
-                                              height: '24px',
-                                              borderRadius: '50%',
-                                              backgroundColor: darkenHex(color, 0.6),
-                                              border: `3px solid ${color}`,
-                                              transform: 'translate(-50%, -50%)',
-                                              boxShadow: `0 0 10px ${color}`,
-                                              zIndex: 5,
-                                              display: 'flex',
-                                              alignItems: 'center',
-                                              justifyContent: 'center',
-                                              color: '#fff',
-                                              fontSize: '10px',
-                                              fontWeight: 'bold',
-                                            }}>
-                                              {expandedMatchGoals.filter(g => g.equipo_id === gol.equipo_id && g.pos_x != null).indexOf(gol) + 1}
+                                  {loadingH2h && !h2hCache[key] ? (
+                                    <div style={{ display: 'flex', justifyContent: 'center', padding: '20px' }}>
+                                      <Loader2 size={20} className="spin" />
+                                    </div>
+                                  ) : h2hTodos.length === 0 ? (
+                                    <div style={{ textAlign: 'center', color: 'rgba(255,255,255,0.3)', fontSize: '12px', padding: '16px' }}>
+                                      No hay más enfrentamientos registrados entre estos equipos.
+                                    </div>
+                                  ) : (
+                                    <>
+                                      {/* Resumen de victorias / empates / derrotas, desde la perspectiva
+                                          del equipo "local" de la card actual.
+                                          IMPORTANTE: se itera sobre `h2hTodos` (incluye el propio
+                                          partido de esta card), no sobre `h2hPartidos`, para que el
+                                          resultado de la card contenedora sí se refleje en el conteo. */}
+                                      {(() => {
+                                        let vLocal = 0, empates = 0, vVisitante = 0
+                                        h2hTodos.forEach(hp => {
+                                          const esMismoOrden = hp.equipo_local_id === detail.partido.equipo_local_id
+                                          const gRef = esMismoOrden ? hp.goles_local : hp.goles_visitante
+                                          const gOtro = esMismoOrden ? hp.goles_visitante : hp.goles_local
+                                          if ((gRef ?? 0) > (gOtro ?? 0)) vLocal++
+                                          else if ((gOtro ?? 0) > (gRef ?? 0)) vVisitante++
+                                          else empates++
+                                        })
+                                        const colorLocal = local?.color_hex || 'var(--color-accent)'
+                                        const colorVisitante = visitante?.color_hex || 'var(--color-error)'
+                                        const totalEnfrentamientos = vLocal + empates + vVisitante
+                                        const pctLocal = totalEnfrentamientos > 0 ? Math.round((vLocal / totalEnfrentamientos) * 100) : null
+                                        const pctEmpates = totalEnfrentamientos > 0 ? Math.round((empates / totalEnfrentamientos) * 100) : null
+                                        const pctVisitante = totalEnfrentamientos > 0 ? Math.round((vVisitante / totalEnfrentamientos) * 100) : null
+                                        return (
+                                          <div style={{
+                                            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                                            padding: '10px 10px', borderRadius: 8, marginBottom: 10,
+                                            background: 'rgba(255,255,255,0.04)',
+                                            border: '1px solid var(--color-border)',
+                                          }}>
+                                            <div style={{ textAlign: 'center', flex: 1 }}>
+                                              <div style={{ fontSize: 26, fontWeight: 800, color: colorLocal, lineHeight: 1 }}>{vLocal}</div>
+                                              {pctLocal !== null && (
+                                                <div style={{ fontSize: 11, fontWeight: 700, color: colorPorPorcentaje(pctLocal), marginTop: 3 }}>{pctLocal}%</div>
+                                              )}
+                                              <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.5)', marginTop: 3 }}>{local?.nombre ?? 'Local'}</div>
                                             </div>
-                                          )
-                                        })}
+                                            <div style={{ textAlign: 'center', flex: 1 }}>
+                                              <div style={{ fontSize: 26, fontWeight: 800, color: 'rgba(255,255,255,0.6)', lineHeight: 1 }}>{empates}</div>
+                                              {pctEmpates !== null && (
+                                                <div style={{ fontSize: 11, fontWeight: 700, color: colorPorPorcentaje(pctEmpates), marginTop: 3 }}>{pctEmpates}%</div>
+                                              )}
+                                              <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.5)', marginTop: 3 }}>Empates</div>
+                                            </div>
+                                            <div style={{ textAlign: 'center', flex: 1 }}>
+                                              <div style={{ fontSize: 26, fontWeight: 800, color: colorVisitante, lineHeight: 1 }}>{vVisitante}</div>
+                                              {pctVisitante !== null && (
+                                                <div style={{ fontSize: 11, fontWeight: 700, color: colorPorPorcentaje(pctVisitante), marginTop: 3 }}>{pctVisitante}%</div>
+                                              )}
+                                              <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.5)', marginTop: 3 }}>{visitante?.nombre ?? 'Visitante'}</div>
+                                            </div>
+                                          </div>
+                                        )
+                                      })()}
+
+                                      {h2hPartidos.length === 0 ? (
+                                        <div style={{ textAlign: 'center', color: 'rgba(255,255,255,0.3)', fontSize: '12px', padding: '16px' }}>
+                                          No hay más enfrentamientos registrados entre estos equipos.
+                                        </div>
+                                      ) : (
+                                        <div className="h2h-scroll" style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                                          {h2hPartidos.map(hp => {
+                                            // Reordenar para que siempre se muestre desde la perspectiva
+                                            // del "local" de la card actual (detail.partido)
+                                            const esMismoOrden = hp.equipo_local_id === detail.partido.equipo_local_id
+                                            const gLocalRef = esMismoOrden ? hp.goles_local : hp.goles_visitante
+                                            const gVisitanteRef = esMismoOrden ? hp.goles_visitante : hp.goles_local
+                                            const refGano = (gLocalRef ?? 0) > (gVisitanteRef ?? 0)
+                                            const otroGano = (gVisitanteRef ?? 0) > (gLocalRef ?? 0)
+                                            const hpEdicion = edicionLabel(hp.torneo_id)
+                                            const hpFase = faseInfo(hp)
+
+                                            return (
+                                              <div key={hp.id} style={{
+                                                display: 'flex', alignItems: 'center', gap: 8,
+                                                padding: '6px 10px', borderRadius: 8,
+                                                background: 'rgba(255,255,255,0.03)',
+                                                border: '1px solid var(--color-border)',
+                                                fontSize: 12,
+                                              }}>
+                                                <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 6, minWidth: 0 }}>
+                                                  <span style={{
+                                                    fontWeight: refGano ? 700 : 500,
+                                                    color: refGano ? 'var(--color-textWH)' : 'rgba(255,255,255,0.55)',
+                                                    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                                                  }}>
+                                                    {local?.nombre ?? '—'}
+                                                  </span>
+                                                  {local?.escudo_url
+                                                    ? <img src={local.escudo_url} style={{ width: 18, height: 18, objectFit: 'contain', flexShrink: 0 }} />
+                                                    : <div style={{ width: 18, height: 18, borderRadius: 4, background: 'var(--color-border)', flexShrink: 0 }} />
+                                                  }
+                                                </div>
+
+                                                <span style={{ fontWeight: 800, fontSize: 13, flexShrink: 0 }}>
+                                                  <span style={{
+                                                    color: refGano ? 'var(--color-accent)' : (otroGano ? 'var(--color-error)' : 'rgba(255,255,255,0.6)'),
+                                                  }}>
+                                                    {gLocalRef ?? '–'}
+                                                  </span>
+                                                  <span style={{ color: 'var(--color-textWH)' }}> : </span>
+                                                  <span style={{
+                                                    color: otroGano ? 'var(--color-accent)' : (refGano ? 'var(--color-error)' : 'rgba(255,255,255,0.6)'),
+                                                  }}>
+                                                    {gVisitanteRef ?? '–'}
+                                                  </span>
+                                                </span>
+
+                                                <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+                                                  {visitante?.escudo_url
+                                                    ? <img src={visitante.escudo_url} style={{ width: 18, height: 18, objectFit: 'contain', flexShrink: 0 }} />
+                                                    : <div style={{ width: 18, height: 18, borderRadius: 4, background: 'var(--color-border)', flexShrink: 0 }} />
+                                                  }
+                                                  <span style={{
+                                                    fontWeight: otroGano ? 700 : 500,
+                                                    color: otroGano ? 'var(--color-textWH)' : 'rgba(255,255,255,0.55)',
+                                                    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                                                  }}>
+                                                    {visitante?.nombre ?? '—'}
+                                                  </span>
+                                                </div>
+
+                                                {/* Edición del torneo en el que ocurrió este partido */}
+                                                {hpEdicion && (
+                                                  <span style={{
+                                                    flexShrink: 0,
+                                                    fontSize: 10,
+                                                    fontWeight: 600,
+                                                    color: 'rgba(255,255,255,0.4)',
+                                                    whiteSpace: 'nowrap',
+                                                    marginLeft: 2,
+                                                    paddingLeft: 8,
+                                                    borderLeft: '1px solid var(--color-border)',
+                                                  }}>
+                                                    {hpEdicion}
+                                                  </span>
+                                                )}
+
+                                                {/* Letra de fase: G = grupos, E = eliminatoria, F = final */}
+                                                {hpFase && (
+                                                  <span title={hpFase.letra === 'G' ? 'Fase de grupos' : hpFase.letra === 'E' ? 'Eliminatoria' : 'Final'} style={{
+                                                    flexShrink: 0,
+                                                    fontSize: 11,
+                                                    fontWeight: 800,
+                                                    color: hpFase.color,
+                                                    whiteSpace: 'nowrap',
+                                                  }}>
+                                                    {hpFase.letra}
+                                                  </span>
+                                                )}
+                                              </div>
+                                            )
+                                          })}
+                                        </div>
+                                      )}
+
+                                      {/* Leyenda de letras de fase */}
+                                      <div style={{
+                                        display: 'flex', alignItems: 'center', justifyContent: 'center', flexWrap: 'wrap',
+                                        gap: '10px', marginTop: 10, paddingTop: 8,
+                                        borderTop: '1px solid var(--color-border)',
+                                      }}>
+                                        <span style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10, color: 'rgba(255,255,255,0.45)' }}>
+                                          <span style={{ fontWeight: 800, color: 'rgba(255,255,255,0.5)' }}>G</span>
+                                          Grupos
+                                        </span>
+                                        <span style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10, color: 'rgba(255,255,255,0.45)' }}>
+                                          <span style={{ fontWeight: 800, color: '#FF4D4D' }}>E</span>
+                                          Eliminatoria
+                                        </span>
+                                        <span style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10, color: 'rgba(255,255,255,0.45)' }}>
+                                          <span style={{ fontWeight: 800, color: '#FFC800' }}>F</span>
+                                          Final
+                                        </span>
                                       </div>
-                                    ) : (
-                                      <div style={{ textAlign: 'center', color: 'rgba(255,255,255,0.3)', fontSize: '13px', padding: '16px' }}>
-                                        No hay goles con ubicación registrada
-                                      </div>
-                                    )}
-                                  </>
-                                )}
+                                    </>
+                                  )}
+                                </div>
                               </div>
                             </div>
                           </div>

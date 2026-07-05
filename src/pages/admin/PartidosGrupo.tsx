@@ -54,6 +54,7 @@ interface Editando {
   goles_local: string
   goles_visitante: string
   fecha: string
+  usarFechaTorneo: boolean
 }
 
 interface MatchManual {
@@ -74,18 +75,42 @@ interface PowerupUsado {
   cantidad: number
 }
 
-function generarFixture(ids: string[]): { local: string; visitante: string }[][] {
-  const n = ids.length
-  const equipos = [...ids]
+/**
+ * Genera un fixture round-robin (todos contra todos, una vuelta) dinámico.
+ * Funciona con cualquier cantidad de equipos (par o impar).
+ * Si es impar, se agrega un "bye" (equipo fantasma) que hace que en cada
+ * jornada un equipo distinto descanse; esos enfrentamientos con el bye
+ * se descartan del resultado final.
+ *
+ * Con N equipos:
+ *  - Par: N-1 jornadas, N/2 partidos cada una.
+ *  - Impar: N jornadas, (N-1)/2 partidos cada una (un equipo descansa por jornada).
+ */
+function generarFixture(idsOriginales: string[]): { local: string; visitante: string }[][] {
+  const BYE = '__BYE__'
+  let equipos = [...idsOriginales]
+
+  const esImpar = equipos.length % 2 !== 0
+  if (esImpar) equipos.push(BYE)
+
+  const n = equipos.length
+  const totalJornadas = n - 1
   const jornadas: { local: string; visitante: string }[][] = []
-  for (let r = 0; r < n - 1; r++) {
+
+  for (let r = 0; r < totalJornadas; r++) {
     const ronda: { local: string; visitante: string }[] = []
     for (let i = 0; i < n / 2; i++) {
-      ronda.push({ local: equipos[i], visitante: equipos[n - 1 - i] })
+      const local = equipos[i]
+      const visitante = equipos[n - 1 - i]
+      if (local !== BYE && visitante !== BYE) {
+        ronda.push({ local, visitante })
+      }
     }
     jornadas.push(ronda)
+    // Rotación estándar de round-robin (se fija el primer equipo)
     equipos.splice(1, 0, equipos.pop()!)
   }
+
   return jornadas
 }
 
@@ -107,6 +132,26 @@ function darkenHex(hex: string, factor: number): string {
   const ng = Math.max(0, Math.min(255, Math.floor(g * factor)))
   const nb = Math.max(0, Math.min(255, Math.floor(b * factor)))
   return `#${nr.toString(16).padStart(2, '0')}${ng.toString(16).padStart(2, '0')}${nb.toString(16).padStart(2, '0')}`
+}
+
+/**
+ * Calcula la cantidad de jornadas y partidos por jornada según el número
+ * de equipos, siguiendo la misma lógica de generarFixture (round-robin a una vuelta).
+ */
+function calcularDimensionesFixture(cantidadEquipos: number): { jornadas: number; partidosPorJornada: number } {
+  if (cantidadEquipos < 2) return { jornadas: 0, partidosPorJornada: 0 }
+  const esImpar = cantidadEquipos % 2 !== 0
+  const n = esImpar ? cantidadEquipos + 1 : cantidadEquipos
+  const jornadas = n - 1
+  const partidosPorJornada = esImpar ? (cantidadEquipos - 1) / 2 : cantidadEquipos / 2
+  return { jornadas, partidosPorJornada }
+}
+
+function crearManualJornadasVacias(cantidadEquipos: number): MatchManual[][] {
+  const { jornadas, partidosPorJornada } = calcularDimensionesFixture(cantidadEquipos)
+  return Array.from({ length: jornadas }, () =>
+    Array.from({ length: partidosPorJornada }, () => ({ local: '', visitante: '' }))
+  )
 }
 
 const OVERLAY: React.CSSProperties = {
@@ -157,9 +202,7 @@ export default function PartidosGrupo() {
   const [guardando, setGuardando] = useState(false)
   const [confirmModal, setConfirmModal] = useState(false)
   const [manualModal, setManualModal] = useState(false)
-  const [manualJornadas, setManualJornadas] = useState<MatchManual[][]>(
-    Array.from({ length: 5 }, () => Array.from({ length: 3 }, () => ({ local: '', visitante: '' })))
-  )
+  const [manualJornadas, setManualJornadas] = useState<MatchManual[][]>([])
   const [jornadaManualActiva, setJornadaManualActiva] = useState(0)
 
   // Estado del modal de partido en vivo
@@ -266,7 +309,7 @@ export default function PartidosGrupo() {
         .select()
         .single()
 
-      if (jornada) {
+      if (jornada && fixture[i].length > 0) {
         await supabase.from('partidos').insert(
           fixture[i].map(p => ({
             torneo_id: torneo.id,
@@ -305,8 +348,10 @@ export default function PartidosGrupo() {
         equiposUsados.add(m.local)
         equiposUsados.add(m.visitante)
       }
-      if (equiposUsados.size !== equipos.length) {
-        alert(`La jornada ${j + 1} no contiene todos los equipos`)
+      // En torneos con número impar de equipos, un equipo descansa cada jornada,
+      // por lo que el set de equipos usados será uno menos que el total.
+      if (equiposUsados.size !== equipos.length && equiposUsados.size !== equipos.length - 1) {
+        alert(`La jornada ${j + 1} no contiene una combinación válida de equipos`)
         return
       }
     }
@@ -353,6 +398,7 @@ export default function PartidosGrupo() {
       goles_local: partido.goles_local != null ? String(partido.goles_local) : '',
       goles_visitante: partido.goles_visitante != null ? String(partido.goles_visitante) : '',
       fecha,
+      usarFechaTorneo: false,   // ← AGREGAR ESTA LÍNEA
     })
 
     const { data: powerupsData } = await supabase
@@ -361,6 +407,13 @@ export default function PartidosGrupo() {
       .eq('partido_id', partido.id)
     setPowerupsEditando((powerupsData as PowerupUsado[]) || [])
   }
+
+  useEffect(() => {
+    if (editando?.usarFechaTorneo && torneo?.created_at) {
+      const fechaTorneo = new Date(torneo.created_at).toISOString().slice(0, 10)
+      setEditando(ed => (ed && ed.fecha !== fechaTorneo ? { ...ed, fecha: fechaTorneo } : ed))
+    }
+  }, [editando?.usarFechaTorneo, torneo?.created_at])
 
   const guardarPartido = async () => {
     if (!editando) return
@@ -822,7 +875,7 @@ export default function PartidosGrupo() {
         <div style={{ display: 'flex', gap: '8px' }}>
           <button
             onClick={() => {
-              setManualJornadas(Array.from({ length: 5 }, () => Array.from({ length: 3 }, () => ({ local: '', visitante: '' }))))
+              setManualJornadas(crearManualJornadasVacias(equipos.length))
               setJornadaManualActiva(0)
               setManualModal(true)
             }}
@@ -868,6 +921,22 @@ export default function PartidosGrupo() {
           Este torneo necesita al menos 2 equipos para generar el fixture.
         </div>
       )}
+
+      {equipos.length >= 2 && (() => {
+        const { jornadas: totalJornadas, partidosPorJornada } = calcularDimensionesFixture(equipos.length)
+        return (
+          <div style={{
+            padding: '12px 20px', borderRadius: '12px',
+            background: 'rgba(0,200,140,0.06)', border: '1px solid rgba(0,200,140,0.2)',
+            color: 'rgba(255,255,255,0.6)', fontSize: '13px',
+          }}>
+            Con <strong style={{ color: 'var(--color-textWH)' }}>{equipos.length}</strong> equipos se generarán{' '}
+            <strong style={{ color: 'var(--color-accent)' }}>{totalJornadas}</strong> jornadas de{' '}
+            <strong style={{ color: 'var(--color-accent)' }}>{partidosPorJornada}</strong> partido{partidosPorJornada !== 1 ? 's' : ''} cada una
+            {equipos.length % 2 !== 0 && ' (un equipo descansa por jornada, al ser número impar)'}.
+          </div>
+        )
+      })()}
 
       {/* Lista de jornadas */}
       {loading ? (
@@ -1135,9 +1204,37 @@ export default function PartidosGrupo() {
 
               <div>
                 <p style={LABEL}>Fecha</p>
+                <label style={{
+                  display: 'flex', alignItems: 'center', gap: '8px',
+                  marginBottom: '8px', cursor: 'pointer', userSelect: 'none',
+                }}>
+                  <input
+                    type="checkbox"
+                    checked={editando.usarFechaTorneo}
+                    onChange={e => {
+                      const marcado = e.target.checked
+                      setEditando(ed => {
+                        if (!ed) return ed
+                        if (marcado && torneo?.created_at) {
+                          return {
+                            ...ed,
+                            usarFechaTorneo: true,
+                            fecha: new Date(torneo.created_at).toISOString().slice(0, 10),
+                          }
+                        }
+                        return { ...ed, usarFechaTorneo: marcado }
+                      })
+                    }}
+                    style={{ width: '16px', height: '16px', cursor: 'pointer', accentColor: 'var(--color-accent)' }}
+                  />
+                  <span style={{ fontSize: '13px', color: 'rgba(255,255,255,0.7)' }}>
+                    Usar fecha del torneo
+                  </span>
+                </label>
                 <input
-                  style={INPUT}
+                  style={{ ...INPUT, opacity: editando.usarFechaTorneo ? 0.6 : 1 }}
                   type="date"
+                  disabled={editando.usarFechaTorneo}
                   value={editando.fecha}
                   onChange={e => setEditando(ed => ed ? { ...ed, fecha: e.target.value } : ed)}
                 />
@@ -1870,30 +1967,30 @@ export default function PartidosGrupo() {
               </button>
             </div>
 
-            <div style={{ display: 'flex', gap: '6px', borderBottom: '1px solid var(--color-border)', paddingBottom: '8px' }}>
-              {[1, 2, 3, 4, 5].map(num => (
+            <div style={{ display: 'flex', gap: '6px', borderBottom: '1px solid var(--color-border)', paddingBottom: '8px', flexWrap: 'wrap' }}>
+              {manualJornadas.map((_, idx) => (
                 <button
-                  key={num}
-                  onClick={() => setJornadaManualActiva(num - 1)}
+                  key={idx}
+                  onClick={() => setJornadaManualActiva(idx)}
                   style={{
                     padding: '8px 14px',
                     borderRadius: '8px',
                     border: '1px solid',
-                    borderColor: jornadaManualActiva === num - 1 ? 'var(--color-accent)' : 'var(--color-border)',
-                    background: jornadaManualActiva === num - 1 ? 'rgba(0,200,140,0.1)' : 'transparent',
-                    color: jornadaManualActiva === num - 1 ? 'var(--color-accent)' : 'rgba(255,255,255,0.6)',
+                    borderColor: jornadaManualActiva === idx ? 'var(--color-accent)' : 'var(--color-border)',
+                    background: jornadaManualActiva === idx ? 'rgba(0,200,140,0.1)' : 'transparent',
+                    color: jornadaManualActiva === idx ? 'var(--color-accent)' : 'rgba(255,255,255,0.6)',
                     fontWeight: '600',
                     fontSize: '13px',
                     cursor: 'pointer',
                   }}
                 >
-                  Jornada {num}
+                  Jornada {idx + 1}
                 </button>
               ))}
             </div>
 
             <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
-              {manualJornadas[jornadaManualActiva].map((match, idx) => (
+              {manualJornadas[jornadaManualActiva]?.map((match, idx) => (
                 <div key={idx} style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
                   <select
                     value={match.local}

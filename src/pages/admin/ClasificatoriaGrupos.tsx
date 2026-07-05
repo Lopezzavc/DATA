@@ -77,6 +77,7 @@ interface EstadisticaEquipo {
   gc: number
   dg: number
   pts: number
+  powerupsUsados: number
 }
 
 interface PowerupInfo {
@@ -266,7 +267,7 @@ export default function ClasificatoriaGrupos() {
 
   const calcularEstadisticas = (): EstadisticaEquipo[] => {
     const statsMap = new Map<string, EstadisticaEquipo>()
-    equipos.forEach(eq => { statsMap.set(eq.id, { equipo: eq, pj: 0, pg: 0, pe: 0, pp: 0, gf: 0, gc: 0, dg: 0, pts: 0 }) })
+    equipos.forEach(eq => { statsMap.set(eq.id, { equipo: eq, pj: 0, pg: 0, pe: 0, pp: 0, gf: 0, gc: 0, dg: 0, pts: 0, powerupsUsados: 0 }) })
     partidos.forEach(p => {
       const local = statsMap.get(p.equipo_local_id)
       const visitante = statsMap.get(p.equipo_visitante_id)
@@ -279,10 +280,20 @@ export default function ClasificatoriaGrupos() {
       else { local.pe++; visitante.pe++; local.pts += 1; visitante.pts += 1 }
     })
     statsMap.forEach(stat => { stat.dg = stat.gf - stat.gc })
+
+    // Total de power-ups usados por equipo (se usa como último criterio de desempate)
+    powerupsUsage.forEach(eqPu => {
+      const stat = statsMap.get(eqPu.equipoId)
+      if (!stat) return
+      stat.powerupsUsados = eqPu.powerups.reduce((sum, p) => sum + p.cantidad, 0)
+    })
+
     return Array.from(statsMap.values()).sort((a, b) => {
       if (b.pts !== a.pts) return b.pts - a.pts
       if (b.dg !== a.dg) return b.dg - a.dg
       if (b.gf !== a.gf) return b.gf - a.gf
+      // Último criterio de desempate: menos power-ups usados clasifica mejor.
+      if (a.powerupsUsados !== b.powerupsUsados) return a.powerupsUsados - b.powerupsUsados
       return a.equipo.nombre.localeCompare(b.equipo.nombre)
     })
   }
@@ -548,7 +559,7 @@ export default function ClasificatoriaGrupos() {
                     {/* Header */}
                     <div style={{
                       display: 'grid',
-                      gridTemplateColumns: '40px 1fr 40px 40px 50px 40px 40px 40px 40px 40px 50px',
+                      gridTemplateColumns: '40px 1fr 40px 40px 50px 40px 40px 40px 40px 40px 40px 50px',
                       padding: '12px 16px',
                       background: 'rgba(0, 93, 67, 1)',
                       borderBottom: '1px solid var(--color-border)',
@@ -565,6 +576,7 @@ export default function ClasificatoriaGrupos() {
                       <span style={{ textAlign: 'center' }}>GF</span>
                       <span style={{ textAlign: 'center' }}>GC</span>
                       <span style={{ textAlign: 'center' }}>DG</span>
+                      <span style={{ textAlign: 'center' }} title="Power-ups usados (desempate: menos usados clasifica mejor)">PU</span>
                       <span style={{ textAlign: 'center', fontWeight: '700', color: 'var(--color-accent)' }}>PTS</span>
                     </div>
 
@@ -576,7 +588,7 @@ export default function ClasificatoriaGrupos() {
                           className="table-row stagger-item"
                           style={{
                             display: 'grid',
-                            gridTemplateColumns: '40px 1fr 40px 40px 50px 40px 40px 40px 40px 40px 50px',
+                            gridTemplateColumns: '40px 1fr 40px 40px 50px 40px 40px 40px 40px 40px 40px 50px',
                             padding: '12px 16px',
                             borderBottom: index < tabla.length - 1 ? '1px solid var(--color-border)' : 'none',
                             color: 'var(--color-textWH)', fontSize: '14px',
@@ -609,6 +621,9 @@ export default function ClasificatoriaGrupos() {
                             color: stat.dg > 0 ? 'var(--color-accent)' : stat.dg < 0 ? 'var(--color-error)' : 'inherit',
                           }}>
                             {stat.dg > 0 ? `+${stat.dg}` : stat.dg}
+                          </span>
+                          <span style={{ textAlign: 'center', color: 'rgba(255,255,255,0.7)' }}>
+                            {stat.powerupsUsados}
                           </span>
                           <span
                             className="pts-cell"

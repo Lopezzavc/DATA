@@ -1,6 +1,6 @@
 import { useEffect, useState, useRef, useCallback } from 'react'
 import {
-  Loader2, Save, Edit3, X, Play, Pause, Square, RotateCcw, Zap, Trophy
+  Loader2, Save, Edit3, X, Play, Pause, Square, RotateCcw, Zap, Trophy, Settings
 } from 'lucide-react'
 import { supabase } from '../../lib/supabase'
 import { useTorneo } from '../../context/TorneoContext'
@@ -52,6 +52,7 @@ interface Editando {
   goles_local: string
   goles_visitante: string
   fecha: string
+  usarFechaTorneo: boolean
 }
 
 interface CatalogoPowerup {
@@ -65,6 +66,11 @@ interface PowerupUsado {
   equipo_id: string
   powerup_id: string
   cantidad: number
+}
+
+interface ManualLlave {
+  local: string
+  visitante: string
 }
 
 // ─── Helpers ───
@@ -111,6 +117,11 @@ const INPUT: React.CSSProperties = {
   border: '1px solid var(--color-border)', background: 'var(--color-background)',
   color: 'var(--color-textWH)', fontSize: '14px', boxSizing: 'border-box',
 }
+const SELECT_STYLE: React.CSSProperties = {
+  ...INPUT,
+  appearance: 'none',
+  cursor: 'pointer',
+}
 
 export default function Eliminatorias() {
   const { torneoSeleccionado } = useTorneo()
@@ -144,6 +155,12 @@ export default function Eliminatorias() {
   const [markerPos, setMarkerPos] = useState({ x: 50, y: 50 })
   const [dragging, setDragging] = useState(false)
   const fieldRef = useRef<HTMLDivElement>(null)
+
+  // ─── Modal manual de enfrentamientos ───
+  const [manualModal, setManualModal] = useState(false)
+  const [manualLlave1, setManualLlave1] = useState<ManualLlave>({ local: '', visitante: '' })
+  const [manualLlave2, setManualLlave2] = useState<ManualLlave>({ local: '', visitante: '' })
+  const [guardandoManual, setGuardandoManual] = useState(false)
 
   const torneo = torneoSeleccionado
 
@@ -190,7 +207,15 @@ export default function Eliminatorias() {
     }
   }, [])
 
-  // ─── Lógica para obtener los 4 primeros de la fase de grupos ───
+  // ─── Sincroniza la fecha del partido con la fecha del torneo cuando el checkbox está activo ───
+  useEffect(() => {
+    if (editando?.usarFechaTorneo && torneo?.created_at) {
+      const fechaTorneo = new Date(torneo.created_at).toISOString().slice(0, 10)
+      setEditando(ed => (ed && ed.fecha !== fechaTorneo ? { ...ed, fecha: fechaTorneo } : ed))
+    }
+  }, [editando?.usarFechaTorneo, torneo?.created_at])
+
+  // ─── Lógica para obtener los 4 primeros de la fase de grupos, en orden 1º,2º,3º,4º ───
   const obtenerTop4 = async (): Promise<Equipo[]> => {
     const { data: partidosGrupos } = await supabase
       .from('partidos')
@@ -225,10 +250,45 @@ export default function Eliminatorias() {
       })
       .slice(0, 4)
 
+    // El orden del array resultante ES el orden de la tabla: [1º, 2º, 3º, 4º]
     return clasificados.map(c => equipos.find(e => e.id === c.id)!).filter(Boolean)
   }
 
-  // ─── Generar partidos eliminatorios (semifinales) ───
+  // ─── Inserta las 4 partidos (ida y vuelta) de las 2 semifinales ───
+  const insertarLlaves = async (llave1: ManualLlave, llave2: ManualLlave) => {
+    if (!torneo) return
+
+    // Eliminar partidos anteriores de eliminatorias (incluida la final)
+    await supabase.from('partidos').delete().eq('torneo_id', torneo.id).eq('fase', 'eliminatorias')
+
+    const insertarPartido = async (
+      localId: string,
+      visitanteId: string,
+      grupo: number
+    ) => {
+      const { error } = await supabase.from('partidos').insert({
+        torneo_id: torneo.id,
+        fase: 'eliminatorias',
+        ronda: 'semifinal',
+        grupo_eliminatorio: grupo,
+        equipo_local_id: localId,
+        equipo_visitante_id: visitanteId,
+        estado: 'pendiente',
+        duracion_segundos: 0,
+      })
+      if (error) throw error
+    }
+
+    // Llave 1 (Semifinal 1: 1º vs 3º)
+    await insertarPartido(llave1.local, llave1.visitante, 1) // ida
+    await insertarPartido(llave1.visitante, llave1.local, 1) // vuelta
+
+    // Llave 2 (Semifinal 2: 2º vs 4º)
+    await insertarPartido(llave2.local, llave2.visitante, 2) // ida
+    await insertarPartido(llave2.visitante, llave2.local, 2) // vuelta
+  }
+
+  // ─── Generar partidos eliminatorios automáticamente: SIEMPRE 1º vs 3º y 2º vs 4º ───
   const generarPartidos = async () => {
     if (!torneo || equipos.length < 4) return
     setGenerando(true)
@@ -241,37 +301,11 @@ export default function Eliminatorias() {
         return
       }
 
-      // Eliminar partidos anteriores de eliminatorias
-      await supabase.from('partidos').delete().eq('torneo_id', torneo.id).eq('fase', 'eliminatorias')
+      // Garantizado: top4[0]=1º, top4[1]=2º, top4[2]=3º, top4[3]=4º
+      const llave1: ManualLlave = { local: top4[0].id, visitante: top4[2].id } // Semifinal 1: 1º vs 3º
+      const llave2: ManualLlave = { local: top4[1].id, visitante: top4[3].id } // Semifinal 2: 2º vs 4º
 
-      const llave1 = { local: top4[0].id, visitante: top4[2].id } // 1º vs 3º
-      const llave2 = { local: top4[1].id, visitante: top4[3].id } // 2º vs 4º
-
-      const insertarPartido = async (
-        localId: string,
-        visitanteId: string,
-        grupo: number
-      ) => {
-        const { error } = await supabase.from('partidos').insert({
-          torneo_id: torneo.id,
-          fase: 'eliminatorias',
-          ronda: 'semifinal',          // ✅ valor que sí respeta el CHECK
-          grupo_eliminatorio: grupo,
-          equipo_local_id: localId,
-          equipo_visitante_id: visitanteId,
-          estado: 'pendiente',
-          duracion_segundos: 0,
-        })
-        if (error) throw error
-      }
-
-      // Llave 1
-      await insertarPartido(llave1.local, llave1.visitante, 1) // ida
-      await insertarPartido(llave1.visitante, llave1.local, 1) // vuelta
-
-      // Llave 2
-      await insertarPartido(llave2.local, llave2.visitante, 2) // ida
-      await insertarPartido(llave2.visitante, llave2.local, 2) // vuelta
+      await insertarLlaves(llave1, llave2)
 
       setConfirmModal(false)
       await fetchData()
@@ -280,6 +314,63 @@ export default function Eliminatorias() {
       alert(`Error al generar: ${error?.message || 'Error desconocido'}`)
     } finally {
       setGenerando(false)
+    }
+  }
+
+  // ─── Modal manual: abrir con equipos precargados si existen top4, o vacíos ───
+  const abrirModalManual = async () => {
+    setGuardandoManual(false)
+    // Si ya hay llaves generadas, precargar con los equipos actuales
+    const llave1Actual = partidosEliminatorios.find(p => p.grupo_eliminatorio === 1)
+    const llave2Actual = partidosEliminatorios.find(p => p.grupo_eliminatorio === 2)
+
+    if (llave1Actual && llave2Actual) {
+      setManualLlave1({ local: llave1Actual.equipo_local_id, visitante: llave1Actual.equipo_visitante_id })
+      setManualLlave2({ local: llave2Actual.equipo_local_id, visitante: llave2Actual.equipo_visitante_id })
+    } else {
+      // Intentar precargar con el top4 de grupos como sugerencia editable
+      try {
+        const top4 = await obtenerTop4()
+        if (top4.length >= 4) {
+          setManualLlave1({ local: top4[0].id, visitante: top4[2].id })
+          setManualLlave2({ local: top4[1].id, visitante: top4[3].id })
+        } else {
+          setManualLlave1({ local: '', visitante: '' })
+          setManualLlave2({ local: '', visitante: '' })
+        }
+      } catch {
+        setManualLlave1({ local: '', visitante: '' })
+        setManualLlave2({ local: '', visitante: '' })
+      }
+    }
+    setManualModal(true)
+  }
+
+  const guardarLlavesManual = async () => {
+    if (!torneo) return
+
+    const seleccionados = [manualLlave1.local, manualLlave1.visitante, manualLlave2.local, manualLlave2.visitante]
+
+    if (seleccionados.some(s => !s)) {
+      alert('Completa los 4 equipos de las semifinales.')
+      return
+    }
+    const setSeleccionados = new Set(seleccionados)
+    if (setSeleccionados.size !== 4) {
+      alert('No puedes repetir el mismo equipo en más de un cruce.')
+      return
+    }
+
+    setGuardandoManual(true)
+    try {
+      await insertarLlaves(manualLlave1, manualLlave2)
+      setManualModal(false)
+      await fetchData()
+    } catch (error: any) {
+      console.error('Error al guardar enfrentamientos manuales:', error)
+      alert(`Error al guardar: ${error?.message || 'Error desconocido'}`)
+    } finally {
+      setGuardandoManual(false)
     }
   }
 
@@ -358,6 +449,7 @@ export default function Eliminatorias() {
       goles_local: partido.goles_local != null ? String(partido.goles_local) : '',
       goles_visitante: partido.goles_visitante != null ? String(partido.goles_visitante) : '',
       fecha,
+      usarFechaTorneo: false,
     })
   }
 
@@ -591,6 +683,14 @@ export default function Eliminatorias() {
   const global1 = llave1.length === 2 ? getGlobal(llave1) : null
   const global2 = llave2.length === 2 ? getGlobal(llave2) : null
 
+  // Equipos ya usados en el modal manual (para evitar duplicados en los selects)
+  const seleccionadosManual = new Set([
+    manualLlave1.local, manualLlave1.visitante, manualLlave2.local, manualLlave2.visitante,
+  ].filter(Boolean))
+
+  const opcionesEquipo = (valorActual: string) =>
+    equipos.filter(eq => eq.id === valorActual || !seleccionadosManual.has(eq.id))
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
       {/* Header */}
@@ -602,6 +702,22 @@ export default function Eliminatorias() {
           </h1>
         </div>
         <div style={{ display: 'flex', gap: '8px' }}>
+          <button
+            onClick={abrirModalManual}
+            disabled={generando || equipos.length < 4}
+            style={{
+              display: 'flex', alignItems: 'center', gap: '8px',
+              padding: '10px 18px', borderRadius: '11px',
+              background: 'var(--color-border)', color: 'var(--color-textWH)',
+              fontWeight: '600', fontSize: '14px',
+              border: '1px solid transparent',
+              cursor: (generando || equipos.length < 4) ? 'not-allowed' : 'pointer',
+              opacity: (generando || equipos.length < 4) ? 0.7 : 1,
+            }}
+          >
+            <Settings size={16} />
+            Manual
+          </button>
           <button
             onClick={() => hayPartidos ? setConfirmModal(true) : generarPartidos()}
             disabled={generando || equipos.length < 4}
@@ -644,6 +760,15 @@ export default function Eliminatorias() {
         </div>
       )}
 
+      <div style={{
+        padding: '12px 20px', borderRadius: '12px',
+        background: 'rgba(0,200,140,0.06)', border: '1px solid rgba(0,200,140,0.2)',
+        color: 'rgba(255,255,255,0.6)', fontSize: '13px',
+      }}>
+        Las semifinales siempre se emparejan como <strong style={{ color: 'var(--color-accent)' }}>1º vs 3º</strong> (Semifinal 1) y{' '}
+        <strong style={{ color: 'var(--color-accent)' }}>2º vs 4º</strong> (Semifinal 2) de la tabla de grupos. Puedes usar "Manual" para elegir tú mismo qué equipos ocupan cada cruce.
+      </div>
+
       {loading ? (
         <div style={{ color: 'rgba(255,255,255,0.4)', fontSize: '14px' }}>Cargando...</div>
       ) : !hayPartidos ? (
@@ -652,7 +777,7 @@ export default function Eliminatorias() {
           border: '2px dashed var(--color-border)',
           textAlign: 'center', color: 'rgba(255,255,255,0.3)', fontSize: '14px',
         }}>
-          No hay partidos eliminatorios. Pulsa "Generar partidos eliminatorios" para crearlos.
+          No hay partidos eliminatorios. Pulsa "Generar partidos eliminatorios" o "Manual" para crearlos.
         </div>
       ) : (
         <>
@@ -769,7 +894,7 @@ export default function Eliminatorias() {
               </span>
             </div>
             <p style={{ fontSize: '14px', color: 'rgba(255,255,255,0.5)', margin: 0 }}>
-              Se borrarán todos los partidos eliminatorios actuales (incluida la final) y se crearán nuevas semifinales. ¿Continuar?
+              Se borrarán todos los partidos eliminatorios actuales (incluida la final) y se crearán nuevas semifinales (1º vs 3º y 2º vs 4º). ¿Continuar?
             </p>
             <div style={{ display: 'flex', gap: '8px' }}>
               <button onClick={() => setConfirmModal(false)} style={{
@@ -788,6 +913,96 @@ export default function Eliminatorias() {
                 Regenerar
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal manual de enfrentamientos */}
+      {manualModal && (
+        <div style={OVERLAY} onClick={() => setManualModal(false)}>
+          <div style={MODAL} onClick={e => e.stopPropagation()}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <span style={{ fontWeight: '700', fontSize: '16px', color: 'var(--color-textWH)' }}>
+                Enfrentamientos manuales
+              </span>
+              <button onClick={() => setManualModal(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'rgba(255,255,255,0.4)' }}>
+                <X size={16} />
+              </button>
+            </div>
+
+            <p style={{ fontSize: '13px', color: 'rgba(255,255,255,0.5)', margin: 0 }}>
+              Elige manualmente qué equipo ocupa cada posición del cruce. Esto reemplazará las eliminatorias actuales (incluida la final, si existe) y se generarán ida y vuelta para cada semifinal.
+            </p>
+
+            <div>
+              <p style={LABEL}>Semifinal 1 (posición 1 vs posición 3)</p>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                <select
+                  value={manualLlave1.local}
+                  onChange={e => setManualLlave1(l => ({ ...l, local: e.target.value }))}
+                  style={SELECT_STYLE}
+                >
+                  <option value="">Equipo (posición 1)</option>
+                  {opcionesEquipo(manualLlave1.local).map(eq => (
+                    <option key={eq.id} value={eq.id}>{eq.nombre}</option>
+                  ))}
+                </select>
+                <span style={{ color: 'rgba(255,255,255,0.3)', fontWeight: '600' }}>vs</span>
+                <select
+                  value={manualLlave1.visitante}
+                  onChange={e => setManualLlave1(l => ({ ...l, visitante: e.target.value }))}
+                  style={SELECT_STYLE}
+                >
+                  <option value="">Equipo (posición 3)</option>
+                  {opcionesEquipo(manualLlave1.visitante).map(eq => (
+                    <option key={eq.id} value={eq.id}>{eq.nombre}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            <div>
+              <p style={LABEL}>Semifinal 2 (posición 2 vs posición 4)</p>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                <select
+                  value={manualLlave2.local}
+                  onChange={e => setManualLlave2(l => ({ ...l, local: e.target.value }))}
+                  style={SELECT_STYLE}
+                >
+                  <option value="">Equipo (posición 2)</option>
+                  {opcionesEquipo(manualLlave2.local).map(eq => (
+                    <option key={eq.id} value={eq.id}>{eq.nombre}</option>
+                  ))}
+                </select>
+                <span style={{ color: 'rgba(255,255,255,0.3)', fontWeight: '600' }}>vs</span>
+                <select
+                  value={manualLlave2.visitante}
+                  onChange={e => setManualLlave2(l => ({ ...l, visitante: e.target.value }))}
+                  style={SELECT_STYLE}
+                >
+                  <option value="">Equipo (posición 4)</option>
+                  {opcionesEquipo(manualLlave2.visitante).map(eq => (
+                    <option key={eq.id} value={eq.id}>{eq.nombre}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            <button
+              onClick={guardarLlavesManual}
+              disabled={guardandoManual}
+              style={{
+                display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px',
+                padding: '12px', borderRadius: '11px',
+                background: 'var(--color-accent)', color: 'var(--color-bgdark)',
+                fontWeight: '700', fontSize: '14px', border: 'none',
+                cursor: guardandoManual ? 'not-allowed' : 'pointer',
+                opacity: guardandoManual ? 0.7 : 1,
+              }}
+            >
+              {guardandoManual ? <Loader2 size={16} className="spin" /> : <Save size={16} />}
+              Guardar enfrentamientos
+            </button>
           </div>
         </div>
       )}
@@ -824,7 +1039,40 @@ export default function Eliminatorias() {
               </div>
               <div>
                 <p style={LABEL}>Fecha</p>
-                <input style={INPUT} type="date" value={editando.fecha} onChange={e => setEditando(ed => ed ? { ...ed, fecha: e.target.value } : ed)} />
+                <label style={{
+                  display: 'flex', alignItems: 'center', gap: '8px',
+                  marginBottom: '8px', cursor: 'pointer', userSelect: 'none',
+                }}>
+                  <input
+                    type="checkbox"
+                    checked={editando.usarFechaTorneo}
+                    onChange={e => {
+                      const marcado = e.target.checked
+                      setEditando(ed => {
+                        if (!ed) return ed
+                        if (marcado && torneo?.created_at) {
+                          return {
+                            ...ed,
+                            usarFechaTorneo: true,
+                            fecha: new Date(torneo.created_at).toISOString().slice(0, 10),
+                          }
+                        }
+                        return { ...ed, usarFechaTorneo: marcado }
+                      })
+                    }}
+                    style={{ width: '16px', height: '16px', cursor: 'pointer', accentColor: 'var(--color-accent)' }}
+                  />
+                  <span style={{ fontSize: '13px', color: 'rgba(255,255,255,0.7)' }}>
+                    Usar fecha del torneo
+                  </span>
+                </label>
+                <input
+                  style={{ ...INPUT, opacity: editando.usarFechaTorneo ? 0.6 : 1 }}
+                  type="date"
+                  disabled={editando.usarFechaTorneo}
+                  value={editando.fecha}
+                  onChange={e => setEditando(ed => ed ? { ...ed, fecha: e.target.value } : ed)}
+                />
               </div>
               <button onClick={guardarPartido} disabled={guardando} style={{
                 display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px',
