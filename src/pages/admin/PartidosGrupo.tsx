@@ -75,6 +75,21 @@ interface PowerupUsado {
   cantidad: number
 }
 
+// Atajos de teclado para asignar power-ups rápidamente
+const POWERUP_SHORTCUTS: Record<string, string> = {
+  'b': 'Boost',
+  'm': 'Sticky Goo',
+  'p': 'Block',
+  'r': 'Ramp',
+  'x': 'Beach Ball',
+  'c': 'Swap Goals',
+  'f': 'Ghosted',
+  'g': 'Big Head',
+  't': 'Big Bumpers',
+  'a': 'Move Ball',
+  'v': 'Move Player',
+}
+
 /**
  * Genera un fixture round-robin (todos contra todos, una vuelta) dinámico.
  * Funciona con cualquier cantidad de equipos (par o impar).
@@ -279,6 +294,24 @@ export default function PartidosGrupo() {
     }
     fetchPowerups()
   }, [])
+
+  // ─── Atajos de teclado para seleccionar power-up rápidamente ───
+  useEffect(() => {
+    if (!modalPowerup) return
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const tecla = e.key.toLowerCase()
+      const nombrePowerup = POWERUP_SHORTCUTS[tecla]
+      if (!nombrePowerup) return
+      const powerup = powerupsCatalogo.find(p => p.nombre === nombrePowerup)
+      if (!powerup) return
+      usarPowerup(modalPowerup.equipoId, powerup.id)
+      setModalPowerup(null)
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [modalPowerup, powerupsCatalogo])
 
   useEffect(() => { fetchData() }, [torneo?.id])
 
@@ -630,9 +663,27 @@ export default function PartidosGrupo() {
     )
   }
 
-  const iniciarPartido = () => {
+  const iniciarPartido = async () => {
     if (!partidoEnVivo) return
     setJugando(true)
+
+    if (!partidoEnVivo.fecha) {
+      const fechaActual = new Date().toISOString()
+      await supabase.from('partidos').update({ fecha: fechaActual }).eq('id', partidoEnVivo.id)
+      setPartidoEnVivo(p => p ? { ...p, fecha: fechaActual } : p)
+      setJornadas(prev =>
+        prev.map(j => ({
+          ...j,
+          partidos: j.partidos.map(p =>
+            p.id === partidoEnVivo.id ? { ...p, fecha: fechaActual } : p
+          ),
+        }))
+      )
+    }
+
+    const ahora = new Date().toISOString()
+    await supabase.from('partidos').update({ inicio_timestamp: ahora }).eq('id', partidoEnVivo.id)
+
     actualizarEstadoVivo('jugando', 0)
     setSegundos(0)
     iniciarTimer(0)
@@ -648,6 +699,10 @@ export default function PartidosGrupo() {
   const reanudarPartido = () => {
     if (!partidoEnVivo) return
     setJugando(true)
+  
+    const nuevoInicio = new Date(Date.now() - segundos * 1000).toISOString()
+    supabase.from('partidos').update({ inicio_timestamp: nuevoInicio }).eq('id', partidoEnVivo.id)
+  
     actualizarEstadoVivo('jugando', segundos)
     iniciarTimer(segundos)
   }
@@ -813,7 +868,6 @@ export default function PartidosGrupo() {
       if (data) setPowerupsUsados(prev => [...prev, data as PowerupUsado])
     }
   }
-
   // Los botones "+" ahora abren el modal de campo
   const sumarGolLocal = () => {
     if (!partidoEnVivo) return
@@ -1786,42 +1840,58 @@ export default function PartidosGrupo() {
                 <X size={16} />
               </button>
             </div>
+            <p style={{ fontSize: 11, color: 'rgba(255,255,255,0.35)', margin: 0 }}>
+              Atajos: B Boost · M Sticky Goo · P Block · R Ramp · X Beach Ball · C Swap Goals · F Ghosted · G Big Head · T Big Bumpers · A Move Ball · V Move Player
+            </p>
             <div style={{
               display: 'flex',
               flexDirection: 'column',
               gap: '4px',
               marginTop: '8px',
             }}>
-              {powerupsCatalogo.map(pu => (
-                <button
-                  key={pu.id}
-                  onClick={() => {
-                    usarPowerup(modalPowerup.equipoId, pu.id)
-                    setModalPowerup(null)
-                  }}
-                  style={{
-                    display: 'flex',
-                    flexDirection: 'row',
-                    alignItems: 'center',
-                    gap: 12,
-                    padding: '8px 10px',
-                    borderRadius: 8,
-                    background: 'transparent',
-                    border: 'none',
-                    cursor: 'pointer',
-                    textAlign: 'left',
-                  }}
-                >
-                  <img
-                    src={POWERUP_IMAGES[pu.nombre] ?? ''}
-                    alt={pu.nombre}
-                    style={{ width: 32, height: 32, objectFit: 'contain', flexShrink: 0 }}
-                  />
-                  <span style={{ fontSize: 14, color: 'var(--color-textWH)', fontWeight: 600 }}>
-                    {pu.nombre}
-                  </span>
-                </button>
-              ))}
+              {powerupsCatalogo.map(pu => {
+                const atajo = Object.entries(POWERUP_SHORTCUTS).find(([, nombre]) => nombre === pu.nombre)?.[0]
+                return (
+                  <button
+                    key={pu.id}
+                    onClick={() => {
+                      usarPowerup(modalPowerup.equipoId, pu.id)
+                      setModalPowerup(null)
+                    }}
+                    style={{
+                      display: 'flex',
+                      flexDirection: 'row',
+                      alignItems: 'center',
+                      gap: 12,
+                      padding: '8px 10px',
+                      borderRadius: 8,
+                      background: 'transparent',
+                      border: 'none',
+                      cursor: 'pointer',
+                      textAlign: 'left',
+                    }}
+                  >
+                    <img
+                      src={POWERUP_IMAGES[pu.nombre] ?? ''}
+                      alt={pu.nombre}
+                      style={{ width: 32, height: 32, objectFit: 'contain', flexShrink: 0 }}
+                    />
+                    <span style={{ fontSize: 14, color: 'var(--color-textWH)', fontWeight: 600, flex: 1 }}>
+                      {pu.nombre}
+                    </span>
+                    {atajo && (
+                      <span style={{
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        width: 22, height: 22, borderRadius: 5,
+                        background: 'var(--color-border)', color: 'rgba(255,255,255,0.6)',
+                        fontSize: 11, fontWeight: 700, textTransform: 'uppercase',
+                      }}>
+                        {atajo}
+                      </span>
+                    )}
+                  </button>
+                )
+              })}
             </div>
           </div>
         </div>

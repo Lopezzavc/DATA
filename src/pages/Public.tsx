@@ -1,7 +1,7 @@
 // src/pages/Public.tsx
 import { useEffect, useState, useCallback, useMemo } from 'react'
 import {
-  ChevronDown, Trophy, Loader2, Zap, History, Calendar
+  ChevronDown, Trophy, Loader2, Zap, History, Calendar, Radio
 } from 'lucide-react'
 import { supabase } from '../lib/supabase'
 import { useTorneoActivo, type Torneo } from '../hooks/useTorneoActivo'
@@ -41,6 +41,7 @@ interface Partido {
   jornada_id?: string | null
   torneo_id?: string
   fase?: string
+  inicio_timestamp?: string | null
 }
 
 interface Jornada {
@@ -102,6 +103,21 @@ const ESTADO_COLORS: Record<Torneo['estado'], string> = {
   lost_media: '#FF4D4D',
 }
 
+// ─── Constantes de reglas del juego (usadas SOLO para estimar probabilidades) ───
+// Fase de grupos y eliminatorias (no-final): máximo 3 goles, 40 minutos (2400s)
+// Final: máximo 5 goles, 1 hora (3600s)
+const REGLAS_PARTIDO = {
+  grupos: { golesMax: 3, duracionMax: 40 * 60 },
+  eliminatorias: { golesMax: 3, duracionMax: 40 * 60 },
+  final: { golesMax: 5, duracionMax: 60 * 60 },
+}
+
+function obtenerReglasPartido(partido: Partido) {
+  if (partido.ronda === 'final') return REGLAS_PARTIDO.final
+  if (partido.fase === 'eliminatorias') return REGLAS_PARTIDO.eliminatorias
+  return REGLAS_PARTIDO.grupos
+}
+
 function darkenHex(hex: string, factor: number): string {
   const r = parseInt(hex.slice(1, 3), 16)
   const g = parseInt(hex.slice(3, 5), 16)
@@ -151,6 +167,167 @@ function h2hKey(equipoAId: string, equipoBId: string) {
   return [equipoAId, equipoBId].sort().join('__')
 }
 
+// ─── Cálculo de probabilidades de victoria/empate/derrota para el partido en vivo ───
+// Combina:
+//  1) Un "prior" histórico basado en enfrentamientos directos entre ambos equipos
+//     (head-to-head), sin importar el torneo.
+//  2) El estado actual del marcador y el tiempo transcurrido respecto a los límites
+//     de la ronda (goles máximos y duración máxima), para que el % se mueva en
+//     tiempo real a medida que el partido avanza.
+// ─── Cálculo de probabilidades de victoria/empate/derrota para el partido en vivo ───
+// Combina:
+//  1) Un "prior" inicial de fuerza de cada equipo, construido como una mezcla
+//     ponderada entre:
+//       - Récord general de cada equipo (victorias/empates/derrotas contra
+//         CUALQUIER rival, en cualquier torneo) → mayor peso, por ser una
+//         muestra más grande y representativa.
+//       - Historial head-to-head directo entre ambos equipos → menor peso,
+//         porque suele tener muy pocas muestras (a veces 1-2 partidos) y no
+//         debería dominar la estimación por sí solo.
+//  2) El estado actual del marcador y el tiempo transcurrido respecto a los
+//     límites de la ronda (goles máximos y duración máxima). El prior actúa
+//     como estimador inicial (más peso al comienzo del partido) y el marcador/
+//     tiempo va tomando el control a medida que el partido avanza o aparece
+//     una diferencia de goles.
+function calcularProbabilidades(params: {
+  partido: Partido
+  golesLocal: number
+  golesVisitante: number
+  segundos: number
+  h2h: Partido[]
+  recordLocal: { victorias: number; empates: number; derrotas: number } | null
+  recordVisitante: { victorias: number; empates: number; derrotas: number } | null
+}): { local: number; empate: number; visitante: number } {
+  const { partido, golesLocal, golesVisitante, segundos, h2h, recordLocal, recordVisitante } = params
+  const { golesMax, duracionMax } = obtenerReglasPartido(partido)
+
+  // ─── 1a) Prior por récord general de cada equipo (independiente entre sí:
+  // la "fuerza" de cada equipo se calcula contra CUALQUIER rival, no solo
+  // entre ellos dos). Se convierte cada récord en una probabilidad de victoria/
+  // empate/derrota "genérica" para ese equipo, con suavizado Laplace. ───
+  const probsRecord = (record: { victorias: number; empates: number; derrotas: number } | null) => {
+    const v = (record?.victorias ?? 0) + 0.5
+    const e = (record?.empates ?? 0) + 0.5
+    const d = (record?.derrotas ?? 0) + 0.5
+    const total = v + e + d
+    return { pv: v / total, pe: e / total, pd: d / total }
+  }
+  const recLocal = probsRecord(recordLocal)
+  const recVisitante = probsRecord(recordVisitante)
+
+  // Combinamos la "fuerza relativa" de ambos equipos: si el local tiene mejor
+  // proporción de victorias que el visitante, el prior por récord general lo
+  // favorece, y viceversa. El empate se estima como el promedio de la tasa de
+  // empates de ambos equipos.
+  const fuerzaLocal = recLocal.pv * (1 - recVisitante.pv)
+  const fuerzaVisitante = recVisitante.pv * (1 - recLocal.pv)
+  const fuerzaEmpate = (recLocal.pe + recVisitante.pe) / 2
+  const sumaFuerza = fuerzaLocal + fuerzaVisitante + fuerzaEmpate
+  const priorRecordLocal = sumaFuerza > 0 ? fuerzaLocal / sumaFuerza : 0.4
+  const priorRecordEmpate = sumaFuerza > 0 ? fuerzaEmpate / sumaFuerza : 0.2
+  const priorRecordVisitante = sumaFuerza > 0 ? fuerzaVisitante / sumaFuerza : 0.4
+
+  // ─── 1b) Prior por head-to-head directo entre ambos equipos ───
+  let priorH2hLocal = 0.4
+  let priorH2hEmpate = 0.2
+  let priorH2hVisitante = 0.4
+  if (h2h.length > 0) {
+    let vLocal = 0.5, empates = 0.5, vVisitante = 0.5 // suavizado (Laplace) para evitar 0/0
+    h2h.forEach(hp => {
+      const esMismoOrden = hp.equipo_local_id === partido.equipo_local_id
+      const gRef = esMismoOrden ? hp.goles_local : hp.goles_visitante
+      const gOtro = esMismoOrden ? hp.goles_visitante : hp.goles_local
+      if ((gRef ?? 0) > (gOtro ?? 0)) vLocal++
+      else if ((gOtro ?? 0) > (gRef ?? 0)) vVisitante++
+      else empates++
+    })
+    const total = vLocal + empates + vVisitante
+    priorH2hLocal = vLocal / total
+    priorH2hEmpate = empates / total
+    priorH2hVisitante = vVisitante / total
+  }
+
+  // ─── 1c) Prior combinado: récord general pesa más (70%) que el H2H directo (30%),
+  // según lo solicitado — el récord general es una muestra más grande y confiable. ───
+  const PESO_RECORD_GENERAL = 0.7
+  const PESO_H2H_DIRECTO = 0.3
+  const priorLocal = priorRecordLocal * PESO_RECORD_GENERAL + priorH2hLocal * PESO_H2H_DIRECTO
+  const priorEmpate = priorRecordEmpate * PESO_RECORD_GENERAL + priorH2hEmpate * PESO_H2H_DIRECTO
+  const priorVisitante = priorRecordVisitante * PESO_RECORD_GENERAL + priorH2hVisitante * PESO_H2H_DIRECTO
+
+  // ─── 2) Si el partido ya terminó por marcador (llegó al máximo de goles) ───
+  if (golesLocal >= golesMax && golesLocal > golesVisitante) {
+    return { local: 100, empate: 0, visitante: 0 }
+  }
+  if (golesVisitante >= golesMax && golesVisitante > golesLocal) {
+    return { local: 0, empate: 0, visitante: 100 }
+  }
+
+  // ─── 3) Ajuste en vivo según diferencia de goles y tiempo restante ───
+  const diferencia = golesLocal - golesVisitante
+  const tiempoRestanteFrac = Math.max(0, Math.min(1, 1 - segundos / duracionMax))
+
+  // Cuanto menos tiempo quede, más "pesa" el marcador actual sobre el prior
+  // (récord general + H2H). peso 0 => todo prior (inicio del partido);
+  // peso 1 => todo marcador (final del partido). Se aplica también un piso
+  // proporcional a la diferencia de goles, para que anotar un gol SIEMPRE
+  // tenga un impacto visible en el %, sin importar cuán poco tiempo haya
+  // transcurrido.
+  const pesoPorTiempo = 1 - tiempoRestanteFrac
+  const golesMaxRegla = obtenerReglasPartido(partido).golesMax
+  const pesoBasePorGoles = Math.min(1, Math.abs(diferencia) / golesMaxRegla) * 0.5
+  const pesoMarcador = Math.max(pesoPorTiempo, pesoBasePorGoles)
+  // Convertimos la diferencia de goles en una ventaja normalizada respecto al máximo posible.
+  const ventajaNormalizada = Math.max(-1, Math.min(1, diferencia / golesMax))
+
+  // Distribución "en vivo" basada puramente en el marcador actual + tiempo restante:
+  // A mayor ventaja y menos tiempo restante, la probabilidad del que va ganando sube fuerte;
+  // el empate se reduce a medida que se acaba el reloj si hay diferencia de goles.
+  let liveLocal: number
+  let liveEmpate: number
+  let liveVisitante: number
+
+  if (diferencia === 0) {
+    // Empatando: el empate tiene más peso cuanto menos tiempo queda
+    liveEmpate = 0.25 + 0.5 * pesoMarcador
+    const restante = 1 - liveEmpate
+    liveLocal = restante / 2
+    liveVisitante = restante / 2
+  } else {
+    const favoritoLocal = diferencia > 0
+    const magnitud = Math.abs(ventajaNormalizada) // 0 a 1
+    // Probabilidad del favorito: sube con la magnitud de la ventaja y con el paso del tiempo
+    const probFavorito = 0.5 + 0.45 * magnitud * (0.4 + 0.6 * pesoMarcador) + 0.05 * pesoMarcador
+    const probFavoritoClamp = Math.min(0.97, probFavorito)
+    liveEmpate = Math.max(0.02, (1 - probFavoritoClamp) * (0.35 * tiempoRestanteFrac + 0.05))
+    const restante = 1 - probFavoritoClamp - liveEmpate
+    if (favoritoLocal) {
+      liveLocal = probFavoritoClamp
+      liveVisitante = Math.max(0.01, restante)
+    } else {
+      liveVisitante = probFavoritoClamp
+      liveLocal = Math.max(0.01, restante)
+    }
+  }
+
+  // ─── 4) Combinamos el prior (récord general + H2H) con el ajuste en vivo,
+  // dando cada vez más peso al marcador/tiempo en vivo a medida que el
+  // partido avanza. ───
+  const combinado = {
+    local: priorLocal * (1 - pesoMarcador) + liveLocal * pesoMarcador,
+    empate: priorEmpate * (1 - pesoMarcador) + liveEmpate * pesoMarcador,
+    visitante: priorVisitante * (1 - pesoMarcador) + liveVisitante * pesoMarcador,
+  }
+
+  const sumaTotal = combinado.local + combinado.empate + combinado.visitante
+  const local = Math.round((combinado.local / sumaTotal) * 100)
+  const empate = Math.round((combinado.empate / sumaTotal) * 100)
+  let visitante = 100 - local - empate
+  if (visitante < 0) visitante = 0
+
+  return { local, empate, visitante }
+}
+
 // ─── Componente principal ───
 export default function Public() {
   const { torneos, torneoActivo, setTorneoActivo } = useTorneoActivo()
@@ -170,8 +347,20 @@ export default function Public() {
 
   // ─── Historial head-to-head (todos los enfrentamientos históricos entre dos equipos,
   // sin importar el torneo). Se cachea por par de equipos para no volver a pedirlo. ───
+  // ─── Historial head-to-head (todos los enfrentamientos históricos entre dos equipos,
+  // sin importar el torneo). Se cachea por par de equipos para no volver a pedirlo. ───
   const [h2hCache, setH2hCache] = useState<Record<string, Partido[]>>({})
   const [loadingH2h, setLoadingH2h] = useState(false)
+  const [h2hCargado, setH2hCargado] = useState<Record<string, boolean>>({})
+
+  // ─── Récord general de cada equipo (victorias/empates/derrotas contra CUALQUIER
+  // rival, en cualquier torneo, fase de grupos + eliminatorias). Se usa como estimador
+  // inicial de fuerza de cada equipo, con más peso que el head-to-head directo
+  // (que suele tener muy pocas muestras). Se cachea por equipo_id. ───
+  const [recordGeneralCache, setRecordGeneralCache] = useState<Record<string, { victorias: number; empates: number; derrotas: number }>>({})
+  const [recordGeneralCargado, setRecordGeneralCargado] = useState<Record<string, boolean>>({})
+
+  const [h2hExpandido, setH2hExpandido] = useState<Record<string, boolean>>({})
 
   // ─── Ganadores por torneo (equipo campeón, calculado desde el partido de ronda "final") ───
   const [ganadoresTorneo, setGanadoresTorneo] = useState<Record<string, Equipo | null>>({})
@@ -179,6 +368,13 @@ export default function Public() {
   // ─── Mapa de torneos (id -> datos básicos) para resolver la edición de cada
   // partido del historial head-to-head, sin importar de qué torneo provenga. ───
   const [torneosMap, setTorneosMap] = useState<Record<string, { edicion: string | null; nombre: string | null; numero: number }>>({})
+
+  // ─── Partido(s) en vivo (jugando/pausado) del torneo activo, para la card destacada ───
+  const [partidosEnVivo, setPartidosEnVivo] = useState<Partido[]>([])
+  const [golesEnVivoPorPartido, setGolesEnVivoPorPartido] = useState<Record<string, Gol[]>>({})
+  const [powerupsEnVivoPorPartido, setPowerupsEnVivoPorPartido] = useState<Record<string, { [equipoId: string]: PowerupInfo[] }>>({})
+  // Reloj en vivo (tick local, sincronizado con duracion_segundos + estado del partido)
+  const [tickEnVivo, setTickEnVivo] = useState(0)
 
   useEffect(() => {
     if (!torneos || torneos.length === 0) return
@@ -356,6 +552,46 @@ export default function Public() {
       } else {
         setPowerupsUsage([])
       }
+
+      // ─── Partido(s) EN VIVO (jugando o pausado) del torneo, para la card destacada ───
+      const { data: enVivoData } = await supabase
+        .from('partidos').select('*')
+        .eq('torneo_id', torneo.id)
+        .in('estado', ['jugando', 'pausado'])
+      setPartidosEnVivo(enVivoData || [])
+
+      if (enVivoData && enVivoData.length > 0) {
+        const idsEnVivo = enVivoData.map(p => p.id)
+
+        const { data: golesEnVivoData } = await supabase
+          .from('goles').select('*').in('partido_id', idsEnVivo).order('minuto', { ascending: true })
+        const golesPorPartido: Record<string, Gol[]> = {}
+        golesEnVivoData?.forEach(g => {
+          if (!golesPorPartido[g.partido_id]) golesPorPartido[g.partido_id] = []
+          golesPorPartido[g.partido_id].push(g)
+        })
+        setGolesEnVivoPorPartido(golesPorPartido)
+
+        const { data: puEnVivoData } = await supabase
+          .from('powerups_usados').select('partido_id, equipo_id, powerup_id, cantidad')
+          .in('partido_id', idsEnVivo)
+        const { data: catalogoEnVivo } = await supabase.from('powerups_catalogo').select('id, nombre')
+        const powerupsPorPartido: Record<string, { [equipoId: string]: PowerupInfo[] }> = {}
+        puEnVivoData?.forEach(pu => {
+          if (!powerupsPorPartido[pu.partido_id]) powerupsPorPartido[pu.partido_id] = {}
+          if (!powerupsPorPartido[pu.partido_id][pu.equipo_id]) powerupsPorPartido[pu.partido_id][pu.equipo_id] = []
+          const cat = catalogoEnVivo?.find(c => c.id === pu.powerup_id)
+          if (cat) {
+            const exist = powerupsPorPartido[pu.partido_id][pu.equipo_id].find(x => x.powerupId === pu.powerup_id)
+            if (exist) exist.cantidad += pu.cantidad
+            else powerupsPorPartido[pu.partido_id][pu.equipo_id].push({ powerupId: pu.powerup_id, nombre: cat.nombre, cantidad: pu.cantidad })
+          }
+        })
+        setPowerupsEnVivoPorPartido(powerupsPorPartido)
+      } else {
+        setGolesEnVivoPorPartido({})
+        setPowerupsEnVivoPorPartido({})
+      }
     } catch (error) {
       console.error('Error cargando datos públicos:', error)
     } finally {
@@ -524,6 +760,22 @@ export default function Public() {
 
         const todos = [...(comoLocal || []), ...(comoVisitante || [])] as Partido[]
         todos.sort((a, b) => {
+          // 1) Ordenar por edición del torneo (más reciente primero)
+          const numA = torneosMap[a.torneo_id!]?.numero ?? 0
+          const numB = torneosMap[b.torneo_id!]?.numero ?? 0
+          if (numA !== numB) return numB - numA
+                
+          // 2) Dentro de la misma edición: grupos antes que eliminatorias antes que final
+          const ordenFase = (p: Partido) => {
+            if (p.ronda === 'final') return 2
+            if (p.fase === 'eliminatorias') return 1
+            return 0 // grupos
+          }
+          const faseA = ordenFase(a)
+          const faseB = ordenFase(b)
+          if (faseA !== faseB) return faseB - faseA // eliminatorias/final antes que grupos (más reciente primero)
+        
+          // 3) Desempate final: fecha o created_at
           const da = a.fecha ? new Date(a.fecha).getTime() : (a.created_at ? new Date(a.created_at).getTime() : 0)
           const db = b.fecha ? new Date(b.fecha).getTime() : (b.created_at ? new Date(b.created_at).getTime() : 0)
           return db - da
@@ -531,6 +783,7 @@ export default function Public() {
 
         if (!cancelado) {
           setH2hCache(prev => ({ ...prev, [key]: todos }))
+          setH2hCargado(prev => ({ ...prev, [key]: true }))
         }
       } catch (error) {
         console.error('Error cargando historial head-to-head:', error)
@@ -543,6 +796,147 @@ export default function Public() {
 
     return () => { cancelado = true }
   }, [expandedMatchId, teamMatches, h2hCache])
+
+  // ─── Cargar historial head-to-head para TODOS los partidos en vivo (para poder
+  // calcular probabilidades de victoria/empate/derrota en la card destacada). ───
+  // IMPORTANTE: se excluye explícitamente el propio partido en vivo (.neq('id', partido.id))
+  // porque, una vez que se marca el primer gol, ese partido pasa a tener goles_local/
+  // goles_visitante no nulos y por lo tanto calificaría para su propia consulta de
+  // historial head-to-head, contaminando el prior histórico con su propio resultado
+  // parcial. Esto es lo que causaba que el % cambiara bruscamente solo al recargar
+  // la página (justo cuando esta consulta se ejecuta de nuevo desde cero).
+  // ─── Cargar historial head-to-head para TODOS los partidos en vivo (para poder
+  // calcular probabilidades de victoria/empate/derrota en la card destacada). ───
+  // IMPORTANTE: se excluye explícitamente el propio partido en vivo (.neq('id', partido.id))
+  // porque, una vez que se marca el primer gol, ese partido pasa a tener goles_local/
+  // goles_visitante no nulos y por lo tanto calificaría para su propia consulta de
+  // historial head-to-head, contaminando el prior histórico con su propio resultado
+  // parcial. Esto es lo que causaba que el % cambiara bruscamente solo al recargar
+  // la página (justo cuando esta consulta se ejecuta de nuevo desde cero).
+  // ─── Cargar historial head-to-head para TODOS los partidos en vivo (para poder
+  // calcular probabilidades de victoria/empate/derrota en la card destacada). ───
+  // IMPORTANTE: se excluye explícitamente el propio partido en vivo (.neq('id', partido.id))
+  // porque, una vez que se marca el primer gol, ese partido pasa a tener goles_local/
+  // goles_visitante no nulos y por lo tanto calificaría para su propia consulta de
+  // historial head-to-head, contaminando el prior histórico con su propio resultado
+  // parcial. Esto es lo que causaba que el % cambiara bruscamente solo al recargar
+  // la página (justo cuando esta consulta se ejecuta de nuevo desde cero).
+  useEffect(() => {
+    if (partidosEnVivo.length === 0) return
+    let cancelado = false
+
+    const cargarH2hEnVivo = async () => {
+      for (const partido of partidosEnVivo) {
+        const key = h2hKey(partido.equipo_local_id, partido.equipo_visitante_id)
+        if (!h2hCache[key]) {
+          try {
+            const { data: comoLocal } = await supabase
+              .from('partidos')
+              .select('*')
+              .eq('equipo_local_id', partido.equipo_local_id)
+              .eq('equipo_visitante_id', partido.equipo_visitante_id)
+              .not('goles_local', 'is', null)
+              .not('goles_visitante', 'is', null)
+              .neq('id', partido.id)
+
+            const { data: comoVisitante } = await supabase
+              .from('partidos')
+              .select('*')
+              .eq('equipo_local_id', partido.equipo_visitante_id)
+              .eq('equipo_visitante_id', partido.equipo_local_id)
+              .not('goles_local', 'is', null)
+              .not('goles_visitante', 'is', null)
+              .neq('id', partido.id)
+
+            // Filtro de seguridad adicional en memoria, por si en el futuro se
+            // reutiliza este resultado desde otro punto sin pasar por el .neq() de arriba.
+            const todos = [...(comoLocal || []), ...(comoVisitante || [])]
+              .filter(p => p.id !== partido.id) as Partido[]
+
+            if (!cancelado) {
+              setH2hCache(prev => (prev[key] ? prev : { ...prev, [key]: todos }))
+              setH2hCargado(prev => (prev[key] ? prev : { ...prev, [key]: true }))
+            }
+          } catch (error) {
+            console.error('Error cargando historial head-to-head (en vivo):', error)
+          }
+        }
+
+        // ─── Récord general de cada equipo del partido (contra CUALQUIER rival,
+        // cualquier torneo, excluyendo también el propio partido en vivo por la
+        // misma razón explicada arriba: podría autoincluirse una vez tiene goles). ───
+        for (const equipoId of [partido.equipo_local_id, partido.equipo_visitante_id]) {
+          if (recordGeneralCache[equipoId]) continue
+
+          try {
+            const { data: comoLocalGen } = await supabase
+              .from('partidos')
+              .select('goles_local, goles_visitante, equipo_local_id, equipo_visitante_id, id')
+              .eq('equipo_local_id', equipoId)
+              .not('goles_local', 'is', null)
+              .not('goles_visitante', 'is', null)
+              .neq('id', partido.id)
+
+            const { data: comoVisitanteGen } = await supabase
+              .from('partidos')
+              .select('goles_local, goles_visitante, equipo_local_id, equipo_visitante_id, id')
+              .eq('equipo_visitante_id', equipoId)
+              .not('goles_local', 'is', null)
+              .not('goles_visitante', 'is', null)
+              .neq('id', partido.id)
+
+            let victorias = 0, empates = 0, derrotas = 0
+            ;(comoLocalGen || []).forEach(p => {
+              if (p.id === partido.id) return
+              if ((p.goles_local ?? 0) > (p.goles_visitante ?? 0)) victorias++
+              else if ((p.goles_local ?? 0) < (p.goles_visitante ?? 0)) derrotas++
+              else empates++
+            })
+            ;(comoVisitanteGen || []).forEach(p => {
+              if (p.id === partido.id) return
+              if ((p.goles_visitante ?? 0) > (p.goles_local ?? 0)) victorias++
+              else if ((p.goles_visitante ?? 0) < (p.goles_local ?? 0)) derrotas++
+              else empates++
+            })
+
+            if (!cancelado) {
+              setRecordGeneralCache(prev => (prev[equipoId] ? prev : { ...prev, [equipoId]: { victorias, empates, derrotas } }))
+              setRecordGeneralCargado(prev => (prev[equipoId] ? prev : { ...prev, [equipoId]: true }))
+            }
+          } catch (error) {
+            console.error('Error cargando récord general del equipo:', error)
+          }
+        }
+      }
+    }
+
+    cargarH2hEnVivo()
+
+    return () => { cancelado = true }
+  }, [partidosEnVivo, h2hCache, recordGeneralCache])
+
+  // ─── Reloj en vivo: recalcula cada segundo mientras haya partidos "jugando",
+  // para que el tiempo transcurrido y las probabilidades se actualicen solas
+  // sin depender únicamente de eventos realtime de Supabase. ───
+  useEffect(() => {
+    const hayJugando = partidosEnVivo.some(p => p.estado === 'jugando')
+    if (!hayJugando) return
+    const interval = setInterval(() => setTickEnVivo(t => t + 1), 1000)
+    return () => clearInterval(interval)
+  }, [partidosEnVivo])
+
+  // Calcula los segundos transcurridos "en vivo" de un partido: si está jugando,
+  // se estima en base a duracion_segundos + tiempo real transcurrido desde la
+  // última carga (aproximado por el tick local); si está pausado, se usa el valor guardado.
+  const segundosEnVivo = useCallback((partido: Partido) => {
+    void tickEnVivo // fuerza recálculo cada segundo mientras esté "jugando"
+    if (partido.estado === 'jugando' && partido.inicio_timestamp) {
+      const inicio = new Date(partido.inicio_timestamp).getTime()
+      return Math.max(0, Math.floor((Date.now() - inicio) / 1000))
+    }
+    // pausado o cualquier otro estado: usar el valor congelado guardado
+    return partido.duracion_segundos || 0
+  }, [tickEnVivo])
 
   // ─── Tabla de clasificación ───
   // IMPORTANTE: el criterio de orden debe ser IDÉNTICO al de ClasificatoriaGrupos.tsx
@@ -586,6 +980,8 @@ export default function Public() {
 
   const equipoById = (id: string) => equipos.find(e => e.id === id)
 
+  const ESCALA_PAGINA = 100
+
   if (!torneoActivo && torneos.length === 0) {
     return (
       <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'linear-gradient(180deg, rgba(0,78,58,1) 0%, rgba(0,47,36,1) 100%)', backgroundAttachment: 'fixed' }}>
@@ -603,6 +999,12 @@ export default function Public() {
       fontFamily: 'Inter, system-ui, sans-serif',
       padding: '40px 32px'
     }}>
+      <style>{`
+        .page-scale-wrapper {
+          transform: scale(${ESCALA_PAGINA / 100});
+          transform-origin: top center;
+        }
+      `}</style>
       <style>{`
         .spin { animation: spin 1s linear infinite; }
         @keyframes spin { to { transform: rotate(360deg); } }
@@ -627,6 +1029,9 @@ export default function Public() {
         .map-container.expanded {
           max-height: 700px;
         }
+        .map-container.expanded.h2h-open {
+          max-height: 2000px;
+        }
 
         .expanded-split {
           display: flex;
@@ -644,10 +1049,58 @@ export default function Public() {
         }
         .h2h-scroll {
           max-height: 340px;
-          overflow-y: auto;
+          overflow: hidden;
+          position: relative;
         }
-        .h2h-scroll::-webkit-scrollbar { width: 6px; }
-        .h2h-scroll::-webkit-scrollbar-thumb { background: var(--color-border); border-radius: 4px; }
+        .h2h-scroll.h2h-full {
+          max-height: none;
+        }
+        .h2h-fade {
+          position: absolute;
+          left: 0;
+          right: 0;
+          bottom: 0;
+          height: 70px;
+          background: linear-gradient(to bottom, transparent 0%, var(--color-background) 90%);
+          pointer-events: none;
+        }
+        .h2h-ver-todos-btn {
+          width: 100%;
+          margin-top: 8px;
+          padding: 8px 12px;
+          border-radius: 8px;
+          background: rgba(0,200,140,0.1);
+          border: 1px solid rgba(0,200,140,0.3);
+          color: var(--color-accent);
+          font-size: 12px;
+          font-weight: 700;
+          cursor: pointer;
+          transition: background 0.15s;
+        }
+        .h2h-ver-todos-btn:hover {
+          background: rgba(0,200,140,0.18);
+        }
+
+        /* ── Card de partido en vivo destacado ── */
+        .live-match-card {
+          position: relative;
+          border-radius: 16px;
+          overflow: hidden;
+          border: 2px solid rgba(255,200,0,0.5);
+          background: linear-gradient(180deg, rgba(255,200,0,0.07) 0%, var(--color-background) 100%);
+          box-shadow: 0 0 0 1px rgba(255,200,0,0.15), 0 10px 30px rgba(0,0,0,0.35);
+        }
+        .live-pulse-dot {
+          animation: livePulse 1.4s ease-in-out infinite;
+        }
+        @keyframes livePulse {
+          0% { box-shadow: 0 0 0 0 rgba(255,200,0,0.6); }
+          70% { box-shadow: 0 0 0 8px rgba(255,200,0,0); }
+          100% { box-shadow: 0 0 0 0 rgba(255,200,0,0); }
+        }
+        .prob-bar-segment {
+          transition: width 0.5s ease;
+        }
 
         @media (max-width: 768px) {
           .expanded-split {
@@ -764,9 +1217,30 @@ export default function Public() {
           .gol-map-container {
             width: 100% !important;
           }
+
+          /* ── Mobile: card en vivo ── */
+          .live-match-teams {
+            flex-direction: row !important;
+            gap: 10px !important;
+          }
+          .live-match-escudo {
+            width: 48px !important;
+            height: 48px !important;
+          }
+          .live-match-score-num {
+            font-size: 34px !important;
+          }
+          .live-match-team-name {
+            font-size: 13px !important;
+          }
+          .live-prob-row {
+            flex-direction: column !important;
+            gap: 6px !important;
+          }
         }
       `}</style>
 
+      <div className="page-scale-wrapper" style={{ maxWidth: `${1400 * (100 / ESCALA_PAGINA)}px`, margin: '0 auto' }}>
       <div className="public-page" style={{ maxWidth: '1400px', margin: '0 auto', display: 'flex', flexDirection: 'column', gap: '32px' }}>
         {/* Header */}
         <div className="page-header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
@@ -892,6 +1366,196 @@ export default function Public() {
           </div>
         ) : (
           <>
+            {/* SECCIÓN EN VIVO: card destacada de partido(s) en curso */}
+            {partidosEnVivo.length > 0 && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+                {partidosEnVivo.map(partido => {
+                  const local = equipoById(partido.equipo_local_id)
+                  const visitante = equipoById(partido.equipo_visitante_id)
+                  obtenerReglasPartido(partido)
+                  const segundosActuales = segundosEnVivo(partido)
+                  const key = h2hKey(partido.equipo_local_id, partido.equipo_visitante_id)
+                  const h2h = h2hCache[key] || []
+                  const recordsListos = !!recordGeneralCargado[partido.equipo_local_id] && !!recordGeneralCargado[partido.equipo_visitante_id]
+
+                  // Derivamos el marcador SIEMPRE desde los goles reales (tabla `goles`),
+                  // no desde partido.goles_local/goles_visitante, para evitar que el
+                  // marcador y las probabilidades queden desincronizados si el campo
+                  // agregado en `partidos` tarda en propagarse vía realtime.
+                  const golesPartidoActual = golesEnVivoPorPartido[partido.id] || []
+                  const golesLocal = golesPartidoActual.filter(g => g.equipo_id === partido.equipo_local_id).length
+                  const golesVisitante = golesPartidoActual.filter(g => g.equipo_id === partido.equipo_visitante_id).length
+
+                  const probs = calcularProbabilidades({
+                    partido,
+                    golesLocal,
+                    golesVisitante,
+                    segundos: segundosActuales,
+                    h2h,
+                    recordLocal: recordGeneralCache[partido.equipo_local_id] || null,
+                    recordVisitante: recordGeneralCache[partido.equipo_visitante_id] || null,
+                  })
+
+                  const golesLocalList = golesPartidoActual
+                    .filter(g => g.equipo_id === partido.equipo_local_id)
+                    .map(g => formatearDuracion(g.minuto))
+                  const golesVisitanteList = golesPartidoActual
+                    .filter(g => g.equipo_id === partido.equipo_visitante_id)
+                    .map(g => formatearDuracion(g.minuto))
+
+                  const powerupsPartidoActual = powerupsEnVivoPorPartido[partido.id] || {}
+                  const colorLocal = local?.color_hex || '#00C88C'
+                  const colorVisitante = visitante?.color_hex || '#FF4D4D'
+                  const colorEmpate = '#9CA3AF'
+
+                  const pausado = partido.estado === 'pausado'
+
+                  return (
+                    <div key={partido.id} className="live-match-card">
+                      {/* Encabezado: indicador EN VIVO + fase + tiempo restante */}
+                      <div style={{
+                        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                        padding: '12px 20px', borderBottom: '1px solid rgba(255,200,0,0.25)',
+                        background: 'rgba(255,200,0,0.06)', flexWrap: 'wrap', gap: '8px',
+                      }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                          <span className="live-pulse-dot" style={{
+                            width: '10px', height: '10px', borderRadius: '50%',
+                            background: '#FFC800', flexShrink: 0,
+                          }} />
+                          <span style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px', fontWeight: 800, color: '#FFC800', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+                            <Radio size={14} />
+                            {pausado ? 'En pausa' : 'En vivo'}
+                          </span>
+                          {faseInfo(partido) && (
+                            <span style={{
+                              fontSize: '11px', fontWeight: 800, padding: '2px 8px', borderRadius: '20px',
+                              color: faseInfo(partido)!.color,
+                              border: `1px solid ${faseInfo(partido)!.color}66`,
+                              background: `${faseInfo(partido)!.color}1A`,
+                            }}>
+                              {partido.ronda === 'final' ? 'FINAL' : (partido.fase === 'eliminatorias' ? 'ELIMINATORIA' : 'GRUPOS')}
+                            </span>
+                          )}
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '14px', fontSize: '12px', color: 'rgba(255,255,255,0.5)', fontWeight: 600 }}>
+                          <span style={{ fontFamily: 'monospace', fontSize: '15px', color: 'var(--color-textWH)', fontWeight: 700, letterSpacing: '1px' }}>
+                            {formatearDuracion(segundosActuales)}
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Marcador principal */}
+                      <div style={{ padding: '24px 28px 18px' }}>
+                        <div className="live-match-teams" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '28px' }}>
+                          {/* Local */}
+                          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px', minWidth: 0 }}>
+                            {local?.escudo_url
+                              ? <img src={local.escudo_url} className="live-match-escudo" style={{ width: 84, height: 84, objectFit: 'contain' }} />
+                              : <div className="live-match-escudo" style={{ width: 84, height: 84, borderRadius: 12, background: 'var(--color-border)' }} />
+                            }
+                            <span className="live-match-team-name" style={{ fontSize: 16, fontWeight: 700, color: 'var(--color-textWH)', textAlign: 'center' }}>
+                              {local?.nombre ?? '—'}
+                            </span>
+                            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2, minHeight: 16 }}>
+                              {golesLocalList.map((t, i) => (
+                                <span key={i} style={{ fontSize: 11, color: 'rgba(255,255,255,0.5)' }}>⚽ {t}</span>
+                              ))}
+                            </div>
+                            {(powerupsPartidoActual[partido.equipo_local_id] || []).length > 0 && (
+                              <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', justifyContent: 'center' }}>
+                                {(powerupsPartidoActual[partido.equipo_local_id] || []).map(pu => (
+                                  <div key={pu.powerupId} className="pu-badge" style={{ display: 'flex', alignItems: 'center', gap: 2, background: 'rgba(0,200,140,0.1)', borderRadius: 6, padding: '2px 6px', border: '1px solid var(--color-accent)' }}>
+                                    <img src={POWERUP_IMAGES[pu.nombre] || ''} style={{ width: 14, height: 14, objectFit: 'contain' }} />
+                                    <span style={{ fontSize: 11, color: 'var(--color-accent)' }}>{pu.cantidad}</span>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+
+                          {/* Marcador central */}
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 14, flexShrink: 0 }}>
+                            <span className="live-match-score-num" style={{ fontSize: 52, fontWeight: 800, color: 'var(--color-textWH)', minWidth: 56, textAlign: 'center' }}>
+                              {golesLocal}
+                            </span>
+                            <span style={{ fontSize: 30, color: 'rgba(255,255,255,0.3)', fontWeight: 600 }}>:</span>
+                            <span className="live-match-score-num" style={{ fontSize: 52, fontWeight: 800, color: 'var(--color-textWH)', minWidth: 56, textAlign: 'center' }}>
+                              {golesVisitante}
+                            </span>
+                          </div>
+
+                          {/* Visitante */}
+                          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px', minWidth: 0 }}>
+                            {visitante?.escudo_url
+                              ? <img src={visitante.escudo_url} className="live-match-escudo" style={{ width: 84, height: 84, objectFit: 'contain' }} />
+                              : <div className="live-match-escudo" style={{ width: 84, height: 84, borderRadius: 12, background: 'var(--color-border)' }} />
+                            }
+                            <span className="live-match-team-name" style={{ fontSize: 16, fontWeight: 700, color: 'var(--color-textWH)', textAlign: 'center' }}>
+                              {visitante?.nombre ?? '—'}
+                            </span>
+                            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2, minHeight: 16 }}>
+                              {golesVisitanteList.map((t, i) => (
+                                <span key={i} style={{ fontSize: 11, color: 'rgba(255,255,255,0.5)' }}>⚽ {t}</span>
+                              ))}
+                            </div>
+                            {(powerupsPartidoActual[partido.equipo_visitante_id] || []).length > 0 && (
+                              <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', justifyContent: 'center' }}>
+                                {(powerupsPartidoActual[partido.equipo_visitante_id] || []).map(pu => (
+                                  <div key={pu.powerupId} className="pu-badge" style={{ display: 'flex', alignItems: 'center', gap: 2, background: 'rgba(0,200,140,0.1)', borderRadius: 6, padding: '2px 6px', border: '1px solid var(--color-accent)' }}>
+                                    <img src={POWERUP_IMAGES[pu.nombre] || ''} style={{ width: 14, height: 14, objectFit: 'contain' }} />
+                                    <span style={{ fontSize: 11, color: 'var(--color-accent)' }}>{pu.cantidad}</span>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Probabilidad de victoria */}
+                      <div style={{ padding: '4px 28px 22px' }}>
+                        <div style={{ fontSize: 11, fontWeight: 700, color: 'rgba(255,255,255,0.45)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8, textAlign: 'center' }}>
+                          Probabilidad de resultado
+                        </div>
+                        {h2hCargado[key] && recordsListos ? (
+                          <>
+                            <div style={{
+                              display: 'flex', width: '100%', height: 14, borderRadius: 8, overflow: 'hidden',
+                              border: '1px solid var(--color-border)', background: 'rgba(255,255,255,0.04)',
+                            }}>
+                              <div className="prob-bar-segment" style={{ width: `${probs.local}%`, background: colorLocal }} />
+                              <div className="prob-bar-segment" style={{ width: `${probs.empate}%`, background: colorEmpate }} />
+                              <div className="prob-bar-segment" style={{ width: `${probs.visitante}%`, background: colorVisitante }} />
+                            </div>
+                            <div className="live-prob-row" style={{ display: 'flex', width: '100%', marginTop: 4 }}>
+                              <div style={{ width: `${probs.local}%`, textAlign: 'center' }}>
+                                <span style={{ fontSize: 14, fontWeight: 800, color: colorLocal }}>{probs.local}%</span>
+                              </div>
+                              <div style={{ width: `${probs.empate}%`, textAlign: 'center' }}>
+                                <span style={{ fontSize: 14, fontWeight: 800, color: colorEmpate }}>{probs.empate}%</span>
+                              </div>
+                              <div style={{ width: `${probs.visitante}%`, textAlign: 'center' }}>
+                                <span style={{ fontSize: 14, fontWeight: 800, color: colorVisitante }}>{probs.visitante}%</span>
+                              </div>
+                            </div>
+                          </>
+                        ) : (
+                          <div style={{
+                            display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
+                            padding: '14px', color: 'rgba(255,255,255,0.4)', fontSize: 12,
+                          }}>
+                            <Loader2 size={14} className="spin" />
+                            Calculando probabilidades...
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+
             {/* SECCIÓN 0: Jornadas */}
             {jornadas.length > 0 && (
               <div style={{ display: 'flex', flexDirection: 'column' }}>
@@ -1152,10 +1816,14 @@ export default function Public() {
                       // ─── FIX: `h2hTodos` incluye el partido actual (detail.partido) y se usa
                       // para el RESUMEN de victorias/empates/derrotas y sus porcentajes, para que
                       // el resultado de la card contenedora sí se tenga en cuenta en el conteo.
-                      // `h2hPartidos` excluye el partido actual y se usa solo para el LISTADO de
-                      // "otros enfrentamientos", ya que ese partido ya se muestra en la card misma. ───
+                      // `h2hPartidos` incluye el partido actual (primero, resaltado) más el resto
+                      // del historial, ya que ahora también debe mostrarse dentro del listado. ───
                       const h2hTodos = h2hCache[key] || []
-                      const h2hPartidos = h2hTodos.filter(p => p.id !== detail.partido.id)
+                      const h2hPartidos = [...h2hTodos].sort((a, b) => {
+                        if (a.id === detail.partido.id) return -1
+                        if (b.id === detail.partido.id) return 1
+                        return 0
+                      })
 
                       return (
                         <div
@@ -1164,13 +1832,14 @@ export default function Public() {
                           onClick={() => {
                             if (isExpanded) {
                               setExpandedMatchId(null)
+                              setH2hExpandido(prev => ({ ...prev, [detail.partido.id]: false }))
                             } else {
                               setExpandedMatchId(detail.partido.id)
                             }
                           }}
                           style={{
                             border: `2px solid ${isExpanded ? 'var(--color-accent)' : 'var(--color-border)'}`,
-                            background: isExpanded ? 'rgba(0,200,140,0.06)' : 'var(--color-background)',
+                            background: isExpanded ? 'var(--color-background)' : 'var(--color-background)',
                           }}
                         >
                           <div className="side-bar" style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: '10px', backgroundColor: empate ? 'gray' : (localGano ? 'rgb(0, 200, 140)' : 'rgb(255, 77, 77)') }} />
@@ -1227,7 +1896,7 @@ export default function Public() {
                               </div>
                             </div>
 
-                            <div className={`map-container ${isExpanded ? 'expanded' : ''}`}>
+                            <div className={`map-container ${isExpanded ? 'expanded' : ''} ${h2hExpandido[detail.partido.id] ? 'h2h-open' : ''}`}>
                               <div className="expanded-split" style={{
                                 borderTop: '1px solid var(--color-border)',
                               }}>
@@ -1302,6 +1971,91 @@ export default function Public() {
                                         </div>
                                       )}
                                     </>
+                                  )}
+                                
+                                {!loadingMatchGoals && expandedMatchGoals.length > 0 && (
+                                    <div style={{
+                                      display: 'flex', gap: 16,
+                                      width: '96%', margin: '14px auto 0',
+                                      padding: '14px 16px',
+                                      borderRadius: 10,
+                                      background: 'rgba(255,255,255,0.03)',
+                                      border: '1px solid var(--color-border)',
+                                    }}>
+                                      <div style={{ flex: 1 }}>
+                                        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}>
+                                          {local?.escudo_url
+                                            ? <img src={local.escudo_url} style={{ width: 16, height: 16, objectFit: 'contain' }} />
+                                            : <div style={{ width: 16, height: 16, borderRadius: 4, background: 'var(--color-border)' }} />
+                                          }
+                                          <span style={{ fontSize: 11, fontWeight: 700, color: 'rgba(255,255,255,0.5)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                                            {local?.nombre ?? 'Local'}
+                                          </span>
+                                        </div>
+                                        <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+                                          {expandedMatchGoals.filter(g => g.equipo_id === detail.partido.equipo_local_id).length === 0 ? (
+                                            <span style={{ fontSize: 12, color: 'rgba(255,255,255,0.3)' }}>Sin goles</span>
+                                          ) : (
+                                            expandedMatchGoals
+                                              .filter(g => g.equipo_id === detail.partido.equipo_local_id)
+                                              .map((g, idx) => (
+                                                <div key={g.id} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                                                  <span style={{
+                                                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                                    width: 18, height: 18, borderRadius: '50%',
+                                                    background: 'rgba(0,200,140,0.15)',
+                                                    border: '1px solid rgba(0,200,140,0.4)',
+                                                    fontSize: 10, fontWeight: 800, color: 'var(--color-accent)',
+                                                    flexShrink: 0,
+                                                  }}>
+                                                    {idx + 1}
+                                                  </span>
+                                                  <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-textWH)' }}>
+                                                    ⚽ {formatearDuracion(g.minuto)}
+                                                  </span>
+                                                </div>
+                                              ))
+                                          )}
+                                        </div>
+                                      </div>
+                                      <div style={{ width: 1, background: 'var(--color-border)' }} />
+                                      <div style={{ flex: 1 }}>
+                                        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8, justifyContent: 'flex-end' }}>
+                                          <span style={{ fontSize: 11, fontWeight: 700, color: 'rgba(255,255,255,0.5)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                                            {visitante?.nombre ?? 'Visitante'}
+                                          </span>
+                                          {visitante?.escudo_url
+                                            ? <img src={visitante.escudo_url} style={{ width: 16, height: 16, objectFit: 'contain' }} />
+                                            : <div style={{ width: 16, height: 16, borderRadius: 4, background: 'var(--color-border)' }} />
+                                          }
+                                        </div>
+                                        <div style={{ display: 'flex', flexDirection: 'column', gap: 5, alignItems: 'flex-end' }}>
+                                          {expandedMatchGoals.filter(g => g.equipo_id === detail.partido.equipo_visitante_id).length === 0 ? (
+                                            <span style={{ fontSize: 12, color: 'rgba(255,255,255,0.3)' }}>Sin goles</span>
+                                          ) : (
+                                            expandedMatchGoals
+                                              .filter(g => g.equipo_id === detail.partido.equipo_visitante_id)
+                                              .map((g, idx) => (
+                                                <div key={g.id} style={{ display: 'flex', alignItems: 'center', gap: 8, flexDirection: 'row-reverse' }}>
+                                                  <span style={{
+                                                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                                    width: 18, height: 18, borderRadius: '50%',
+                                                    background: 'rgba(0,200,140,0.15)',
+                                                    border: '1px solid rgba(0,200,140,0.4)',
+                                                    fontSize: 10, fontWeight: 800, color: 'var(--color-accent)',
+                                                    flexShrink: 0,
+                                                  }}>
+                                                    {idx + 1}
+                                                  </span>
+                                                  <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-textWH)' }}>
+                                                    ⚽ {formatearDuracion(g.minuto)}
+                                                  </span>
+                                                </div>
+                                              ))
+                                          )}
+                                        </div>
+                                      </div>
+                                    </div>
                                   )}
                                 </div>
 
@@ -1378,7 +2132,8 @@ export default function Public() {
                                           No hay más enfrentamientos registrados entre estos equipos.
                                         </div>
                                       ) : (
-                                        <div className="h2h-scroll" style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                                        <>
+                                        <div className={`h2h-scroll ${h2hExpandido[detail.partido.id] ? 'h2h-full' : ''}`} style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                                           {h2hPartidos.map(hp => {
                                             // Reordenar para que siempre se muestre desde la perspectiva
                                             // del "local" de la card actual (detail.partido)
@@ -1389,13 +2144,15 @@ export default function Public() {
                                             const otroGano = (gVisitanteRef ?? 0) > (gLocalRef ?? 0)
                                             const hpEdicion = edicionLabel(hp.torneo_id)
                                             const hpFase = faseInfo(hp)
+                                            const esPartidoActual = hp.id === detail.partido.id
 
                                             return (
                                               <div key={hp.id} style={{
                                                 display: 'flex', alignItems: 'center', gap: 8,
                                                 padding: '6px 10px', borderRadius: 8,
-                                                background: 'rgba(255,255,255,0.03)',
-                                                border: '1px solid var(--color-border)',
+                                                background: esPartidoActual ? 'rgba(0,200,140,0.16)' : 'rgba(255,255,255,0.03)',
+                                                border: esPartidoActual ? '1px solid rgba(0,200,140,0.7)' : '1px solid var(--color-border)',
+                                                boxShadow: esPartidoActual ? '0 0 8px rgba(0,200,140,0.35)' : 'none',
                                                 fontSize: 12,
                                               }}>
                                                 <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 6, minWidth: 0 }}>
@@ -1468,10 +2225,43 @@ export default function Public() {
                                                     {hpFase.letra}
                                                   </span>
                                                 )}
+
+                                                {/* Indicador de "último" para el partido actual de esta card */}
+                                                {esPartidoActual && (
+                                                  <span style={{
+                                                    flexShrink: 0,
+                                                    fontSize: 9,
+                                                    fontWeight: 800,
+                                                    color: 'var(--color-accent)',
+                                                    whiteSpace: 'nowrap',
+                                                    textTransform: 'uppercase',
+                                                    letterSpacing: '0.04em',
+                                                    marginLeft: 2,
+                                                    paddingLeft: 6,
+                                                    borderLeft: '1px solid rgba(0,200,140,0.3)',
+                                                  }}>
+                                                    Último
+                                                  </span>
+                                                )}
                                               </div>
                                             )
                                           })}
+                                          {!h2hExpandido[detail.partido.id] && h2hPartidos.length >= 8 && (
+                                            <div className="h2h-fade" />
+                                          )}
                                         </div>
+                                        {!h2hExpandido[detail.partido.id] && h2hPartidos.length >= 8 && (
+                                          <button
+                                            className="h2h-ver-todos-btn"
+                                            onClick={(e) => {
+                                              e.stopPropagation()
+                                              setH2hExpandido(prev => ({ ...prev, [detail.partido.id]: true }))
+                                            }}
+                                          >
+                                            Ver todos ({h2hPartidos.length})
+                                          </button>
+                                        )}
+                                        </>
                                       )}
 
                                       {/* Leyenda de letras de fase */}
@@ -1557,6 +2347,7 @@ export default function Public() {
             </div>
           </>
         )}
+      </div>
       </div>
     </div>
   )

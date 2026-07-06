@@ -533,9 +533,28 @@ export default function Eliminatorias() {
     setPartidosEliminatorios(prev => prev.map(p => p.id === partidoEnVivo.id ? { ...p, estado: nuevoEstado, duracion_segundos: segundosActuales } : p))
   }
 
-  const iniciarPartido = () => { setJugando(true); actualizarEstadoVivo('jugando', 0); setSegundos(0); iniciarTimer(0) }
+  const iniciarPartido = async () => {
+    if (!partidoEnVivo) return
+    setJugando(true)
+
+    const ahora = new Date().toISOString()
+    await supabase.from('partidos').update({ inicio_timestamp: ahora }).eq('id', partidoEnVivo.id)
+
+    actualizarEstadoVivo('jugando', 0)
+    setSegundos(0)
+    iniciarTimer(0)
+  }
   const pausarPartido = () => { setJugando(false); pausarTimer(); actualizarEstadoVivo('pausado', segundos) }
-  const reanudarPartido = () => { setJugando(true); actualizarEstadoVivo('jugando', segundos); iniciarTimer(segundos) }
+  const reanudarPartido = () => {
+    if (!partidoEnVivo) return
+    setJugando(true)
+    
+    const nuevoInicio = new Date(Date.now() - segundos * 1000).toISOString()
+    supabase.from('partidos').update({ inicio_timestamp: nuevoInicio }).eq('id', partidoEnVivo.id)
+    
+    actualizarEstadoVivo('jugando', segundos)
+    iniciarTimer(segundos)
+  }
   const terminarPartido = async () => { setJugando(false); pausarTimer(); await actualizarEstadoVivo('finalizado', segundos); cerrarEnVivo() }
 
   const actualizarGoles = async (local: number, visitante: number) => {
