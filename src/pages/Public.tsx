@@ -2226,23 +2226,6 @@ export default function Public() {
                                                   </span>
                                                 )}
 
-                                                {/* Indicador de "último" para el partido actual de esta card */}
-                                                {esPartidoActual && (
-                                                  <span style={{
-                                                    flexShrink: 0,
-                                                    fontSize: 9,
-                                                    fontWeight: 800,
-                                                    color: 'var(--color-accent)',
-                                                    whiteSpace: 'nowrap',
-                                                    textTransform: 'uppercase',
-                                                    letterSpacing: '0.04em',
-                                                    marginLeft: 2,
-                                                    paddingLeft: 6,
-                                                    borderLeft: '1px solid rgba(0,200,140,0.3)',
-                                                  }}>
-                                                    Último
-                                                  </span>
-                                                )}
                                               </div>
                                             )
                                           })}
