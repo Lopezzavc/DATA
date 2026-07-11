@@ -1,7 +1,7 @@
 // src/pages/Public.tsx
 import { useEffect, useState, useCallback, useMemo } from 'react'
 import {
-  ChevronDown, Trophy, Loader2, Zap, History, Calendar, Radio
+  ChevronDown, Trophy, Loader2, Zap, History, Calendar, Radio, Check, X as XIcon, User
 } from 'lucide-react'
 import { supabase } from '../lib/supabase'
 import { useTorneoActivo, type Torneo } from '../hooks/useTorneoActivo'
@@ -24,6 +24,7 @@ interface Equipo {
   nombre: string
   escudo_url: string | null
   color_hex?: string | null
+  dt?: string | null
 }
 
 interface Partido {
@@ -76,6 +77,28 @@ interface MatchDetail {
   powerups: { [equipoId: string]: PowerupInfo[] }
 }
 
+// ─── Racha y forma reciente de un equipo (feature 1) ───
+interface RachaYForma {
+  rachaMaxima: number // mayor racha histórica sin perder (victorias + empates consecutivos)
+  ultimos5: ('V' | 'E' | 'D')[] // más reciente al final
+}
+
+// ─── Progresión de goles por intervalos de minutos (feature 4) ───
+// Intervalos en minutos: (1,15) (16,30) (31,45) (46,60) (61,75) (75>)
+const INTERVALOS_GOLES: { desde: number; hasta: number; label: string }[] = [
+  { desde: 0, hasta: 400, label: '0:00-6:40' },
+  { desde: 400, hasta: 800, label: '6:40-13:20' },
+  { desde: 800, hasta: 1200, label: '13:20-20:00' },
+  { desde: 1200, hasta: 1600, label: '20:00-26:40' },
+  { desde: 1600, hasta: 2000, label: '26:40-33:20' },
+  { desde: 2000, hasta: Infinity, label: '33:20-40:00+' },
+]
+const INTERVALO_COLORES = ['#FF2D6B', '#FFA135', '#F4E018', '#2FE07A', '#2FB6E0', '#B5266E']
+
+interface ProgresionGoles {
+  conteos: number[] // uno por cada INTERVALOS_GOLES
+}
+
 // ─── Constantes ───
 const POWERUP_IMAGES: Record<string, string> = {
   'Beach Ball': beachBall,
@@ -103,13 +126,13 @@ const ESTADO_COLORS: Record<Torneo['estado'], string> = {
   lost_media: '#FF4D4D',
 }
 
-// ─── Constantes de reglas del juego (usadas SOLO para estimar probabilidades) ───
-// Fase de grupos y eliminatorias (no-final): máximo 3 goles, 40 minutos (2400s)
-// Final: máximo 5 goles, 1 hora (3600s)
+// ─── Constantes de reglas del juego (usadas para límites de partido y probabilidades) ───
+// Fase de grupos y eliminatorias (no-final): máximo 3 goles, 36 minutos (2160s)
+// Final: máximo 5 goles, 55 minutos (3300s)
 const REGLAS_PARTIDO = {
-  grupos: { golesMax: 3, duracionMax: 40 * 60 },
-  eliminatorias: { golesMax: 3, duracionMax: 40 * 60 },
-  final: { golesMax: 5, duracionMax: 60 * 60 },
+  grupos: { golesMax: 3, duracionMax: 36 * 60 },
+  eliminatorias: { golesMax: 3, duracionMax: 36 * 60 },
+  final: { golesMax: 5, duracionMax: 55 * 60 },
 }
 
 function obtenerReglasPartido(partido: Partido) {
@@ -167,44 +190,71 @@ function h2hKey(equipoAId: string, equipoBId: string) {
   return [equipoAId, equipoBId].sort().join('__')
 }
 
+// ─── Cálculo de racha máxima (sin derrota: victorias + empates cuentan) y forma
+// de los últimos 5 partidos, a partir del historial completo de un equipo (orden
+// cronológico ascendente esperado). ───
+function calcularRachaYForma(partidosOrdenadosAsc: { golesA: number | null; golesB: number | null }[]): RachaYForma {
+  let rachaMaxima = 0
+  let rachaActual = 0
+  const resultados: ('V' | 'E' | 'D')[] = []
+
+  partidosOrdenadosAsc.forEach(p => {
+    if (p.golesA == null || p.golesB == null) return
+    let resultado: 'V' | 'E' | 'D'
+    if (p.golesA > p.golesB) resultado = 'V'
+    else if (p.golesA < p.golesB) resultado = 'D'
+    else resultado = 'E'
+
+    resultados.push(resultado)
+
+    if (resultado === 'D') {
+      rachaActual = 0
+    } else {
+      rachaActual++
+      if (rachaActual > rachaMaxima) rachaMaxima = rachaActual
+    }
+  })
+
+  const ultimos5 = resultados.slice(-5)
+  return { rachaMaxima, ultimos5 }
+}
+
+// ─── Cálculo de progresión de goles por intervalos de minutos, a partir de la
+// lista completa de goles históricos anotados por un equipo. ───
+function calcularProgresionGoles(golesDelEquipo: { minuto: number }[]): ProgresionGoles {
+  const conteos = new Array(INTERVALOS_GOLES.length).fill(0)
+  golesDelEquipo.forEach(g => {
+    const segundos = g.minuto // ya viene en segundos desde la tabla `goles`
+    const idx = INTERVALOS_GOLES.findIndex(iv => segundos >= iv.desde && segundos < iv.hasta)
+    if (idx >= 0) conteos[idx]++
+  })
+  return { conteos }
+}
+
 // ─── Cálculo de probabilidades de victoria/empate/derrota para el partido en vivo ───
-// Combina:
-//  1) Un "prior" histórico basado en enfrentamientos directos entre ambos equipos
-//     (head-to-head), sin importar el torneo.
-//  2) El estado actual del marcador y el tiempo transcurrido respecto a los límites
-//     de la ronda (goles máximos y duración máxima), para que el % se mueva en
-//     tiempo real a medida que el partido avanza.
-// ─── Cálculo de probabilidades de victoria/empate/derrota para el partido en vivo ───
-// Combina:
-//  1) Un "prior" inicial de fuerza de cada equipo, construido como una mezcla
-//     ponderada entre:
-//       - Récord general de cada equipo (victorias/empates/derrotas contra
-//         CUALQUIER rival, en cualquier torneo) → mayor peso, por ser una
-//         muestra más grande y representativa.
-//       - Historial head-to-head directo entre ambos equipos → menor peso,
-//         porque suele tener muy pocas muestras (a veces 1-2 partidos) y no
-//         debería dominar la estimación por sí solo.
-//  2) El estado actual del marcador y el tiempo transcurrido respecto a los
-//     límites de la ronda (goles máximos y duración máxima). El prior actúa
-//     como estimador inicial (más peso al comienzo del partido) y el marcador/
-//     tiempo va tomando el control a medida que el partido avanza o aparece
-//     una diferencia de goles.
+// Nuevo enfoque (más determinista con marcador + tiempo):
+//  1) Un "prior" inicial de fuerza de cada equipo basado ÚNICAMENTE en su récord
+//     histórico general (% de partidos ganados contra cualquier rival). Este prior
+//     solo determina el punto de partida (minuto 0, marcador 0-0).
+//  2) A medida que el partido avanza (más tiempo transcurrido) y/o aparece una
+//     diferencia de goles, el peso se traslada agresivamente hacia el marcador
+//     real y el tiempo restante, de forma que cerca del final del partido con
+//     ventaja en el marcador la probabilidad del equipo que va ganando se acerque
+//     al 98-99%.
 function calcularProbabilidades(params: {
   partido: Partido
   golesLocal: number
   golesVisitante: number
   segundos: number
-  h2h: Partido[]
   recordLocal: { victorias: number; empates: number; derrotas: number } | null
   recordVisitante: { victorias: number; empates: number; derrotas: number } | null
 }): { local: number; empate: number; visitante: number } {
-  const { partido, golesLocal, golesVisitante, segundos, h2h, recordLocal, recordVisitante } = params
+  const { partido, golesLocal, golesVisitante, segundos, recordLocal, recordVisitante } = params
   const { golesMax, duracionMax } = obtenerReglasPartido(partido)
 
-  // ─── 1a) Prior por récord general de cada equipo (independiente entre sí:
-  // la "fuerza" de cada equipo se calcula contra CUALQUIER rival, no solo
-  // entre ellos dos). Se convierte cada récord en una probabilidad de victoria/
-  // empate/derrota "genérica" para ese equipo, con suavizado Laplace. ───
+  // ─── 1) Prior inicial por récord general de cada equipo (independiente entre
+  // sí: la "fuerza" de cada equipo se calcula contra CUALQUIER rival). Suavizado
+  // Laplace para evitar 0/0 con pocas muestras. ───
   const probsRecord = (record: { victorias: number; empates: number; derrotas: number } | null) => {
     const v = (record?.victorias ?? 0) + 0.5
     const e = (record?.empates ?? 0) + 0.5
@@ -215,45 +265,13 @@ function calcularProbabilidades(params: {
   const recLocal = probsRecord(recordLocal)
   const recVisitante = probsRecord(recordVisitante)
 
-  // Combinamos la "fuerza relativa" de ambos equipos: si el local tiene mejor
-  // proporción de victorias que el visitante, el prior por récord general lo
-  // favorece, y viceversa. El empate se estima como el promedio de la tasa de
-  // empates de ambos equipos.
   const fuerzaLocal = recLocal.pv * (1 - recVisitante.pv)
   const fuerzaVisitante = recVisitante.pv * (1 - recLocal.pv)
   const fuerzaEmpate = (recLocal.pe + recVisitante.pe) / 2
   const sumaFuerza = fuerzaLocal + fuerzaVisitante + fuerzaEmpate
-  const priorRecordLocal = sumaFuerza > 0 ? fuerzaLocal / sumaFuerza : 0.4
-  const priorRecordEmpate = sumaFuerza > 0 ? fuerzaEmpate / sumaFuerza : 0.2
-  const priorRecordVisitante = sumaFuerza > 0 ? fuerzaVisitante / sumaFuerza : 0.4
-
-  // ─── 1b) Prior por head-to-head directo entre ambos equipos ───
-  let priorH2hLocal = 0.4
-  let priorH2hEmpate = 0.2
-  let priorH2hVisitante = 0.4
-  if (h2h.length > 0) {
-    let vLocal = 0.5, empates = 0.5, vVisitante = 0.5 // suavizado (Laplace) para evitar 0/0
-    h2h.forEach(hp => {
-      const esMismoOrden = hp.equipo_local_id === partido.equipo_local_id
-      const gRef = esMismoOrden ? hp.goles_local : hp.goles_visitante
-      const gOtro = esMismoOrden ? hp.goles_visitante : hp.goles_local
-      if ((gRef ?? 0) > (gOtro ?? 0)) vLocal++
-      else if ((gOtro ?? 0) > (gRef ?? 0)) vVisitante++
-      else empates++
-    })
-    const total = vLocal + empates + vVisitante
-    priorH2hLocal = vLocal / total
-    priorH2hEmpate = empates / total
-    priorH2hVisitante = vVisitante / total
-  }
-
-  // ─── 1c) Prior combinado: récord general pesa más (70%) que el H2H directo (30%),
-  // según lo solicitado — el récord general es una muestra más grande y confiable. ───
-  const PESO_RECORD_GENERAL = 0.7
-  const PESO_H2H_DIRECTO = 0.3
-  const priorLocal = priorRecordLocal * PESO_RECORD_GENERAL + priorH2hLocal * PESO_H2H_DIRECTO
-  const priorEmpate = priorRecordEmpate * PESO_RECORD_GENERAL + priorH2hEmpate * PESO_H2H_DIRECTO
-  const priorVisitante = priorRecordVisitante * PESO_RECORD_GENERAL + priorH2hVisitante * PESO_H2H_DIRECTO
+  const priorLocal = sumaFuerza > 0 ? fuerzaLocal / sumaFuerza : 0.4
+  const priorEmpate = sumaFuerza > 0 ? fuerzaEmpate / sumaFuerza : 0.2
+  const priorVisitante = sumaFuerza > 0 ? fuerzaVisitante / sumaFuerza : 0.4
 
   // ─── 2) Si el partido ya terminó por marcador (llegó al máximo de goles) ───
   if (golesLocal >= golesMax && golesLocal > golesVisitante) {
@@ -266,53 +284,54 @@ function calcularProbabilidades(params: {
   // ─── 3) Ajuste en vivo según diferencia de goles y tiempo restante ───
   const diferencia = golesLocal - golesVisitante
   const tiempoRestanteFrac = Math.max(0, Math.min(1, 1 - segundos / duracionMax))
+  const tiempoTranscurridoFrac = 1 - tiempoRestanteFrac
 
-  // Cuanto menos tiempo quede, más "pesa" el marcador actual sobre el prior
-  // (récord general + H2H). peso 0 => todo prior (inicio del partido);
-  // peso 1 => todo marcador (final del partido). Se aplica también un piso
-  // proporcional a la diferencia de goles, para que anotar un gol SIEMPRE
-  // tenga un impacto visible en el %, sin importar cuán poco tiempo haya
-  // transcurrido.
-  const pesoPorTiempo = 1 - tiempoRestanteFrac
-  const golesMaxRegla = obtenerReglasPartido(partido).golesMax
-  const pesoBasePorGoles = Math.min(1, Math.abs(diferencia) / golesMaxRegla) * 0.5
-  const pesoMarcador = Math.max(pesoPorTiempo, pesoBasePorGoles)
-  // Convertimos la diferencia de goles en una ventaja normalizada respecto al máximo posible.
-  const ventajaNormalizada = Math.max(-1, Math.min(1, diferencia / golesMax))
+  // El peso del marcador/tiempo en vivo crece agresivamente con el tiempo
+  // transcurrido y con la magnitud de la diferencia de goles respecto al máximo
+  // posible. Se usa una curva cuadrática sobre el tiempo transcurrido para que
+  // el prior domine al inicio del partido, pero pierda peso rápido después.
+  const pesoPorTiempo = Math.pow(tiempoTranscurridoFrac, 1.6)
+  const magnitudDiferencia = Math.min(1, Math.abs(diferencia) / golesMax)
+  // Con diferencia de goles, aunque sea muy temprano, ya debe pesar bastante el marcador
+  const pesoBasePorGoles = magnitudDiferencia > 0 ? 0.35 + 0.35 * magnitudDiferencia : 0
+  const pesoMarcador = Math.max(pesoPorTiempo, pesoBasePorGoles, diferencia !== 0 ? 0.15 : 0)
 
-  // Distribución "en vivo" basada puramente en el marcador actual + tiempo restante:
-  // A mayor ventaja y menos tiempo restante, la probabilidad del que va ganando sube fuerte;
-  // el empate se reduce a medida que se acaba el reloj si hay diferencia de goles.
   let liveLocal: number
   let liveEmpate: number
   let liveVisitante: number
 
   if (diferencia === 0) {
-    // Empatando: el empate tiene más peso cuanto menos tiempo queda
-    liveEmpate = 0.25 + 0.5 * pesoMarcador
+    // Empatando: el empate gana peso cuanto menos tiempo queda (partido puede
+    // terminar en empate si el reglamento lo permite, o simplemente refleja
+    // incertidumbre alta)
+    liveEmpate = 0.2 + 0.55 * tiempoTranscurridoFrac
     const restante = 1 - liveEmpate
     liveLocal = restante / 2
     liveVisitante = restante / 2
   } else {
     const favoritoLocal = diferencia > 0
-    const magnitud = Math.abs(ventajaNormalizada) // 0 a 1
-    // Probabilidad del favorito: sube con la magnitud de la ventaja y con el paso del tiempo
-    const probFavorito = 0.5 + 0.45 * magnitud * (0.4 + 0.6 * pesoMarcador) + 0.05 * pesoMarcador
-    const probFavoritoClamp = Math.min(0.97, probFavorito)
-    liveEmpate = Math.max(0.02, (1 - probFavoritoClamp) * (0.35 * tiempoRestanteFrac + 0.05))
+    // Combinamos magnitud de la diferencia de goles con el tiempo transcurrido:
+    // con ventaja de 1 gol a falta de poco tiempo, la probabilidad ya debe ser
+    // muy alta (ej. 2-0 al minuto 35 de 36 -> ~98-99%).
+    const factorGoles = magnitudDiferencia // 0 a 1 (1 = diferencia máxima posible)
+    const probFavorito = 0.5
+      + 0.30 * factorGoles
+      + 0.45 * tiempoTranscurridoFrac * (0.5 + 0.5 * factorGoles)
+    const probFavoritoClamp = Math.min(0.99, probFavorito)
+    liveEmpate = Math.max(0.005, (1 - probFavoritoClamp) * (0.4 * tiempoRestanteFrac + 0.05))
     const restante = 1 - probFavoritoClamp - liveEmpate
     if (favoritoLocal) {
       liveLocal = probFavoritoClamp
-      liveVisitante = Math.max(0.01, restante)
+      liveVisitante = Math.max(0.005, restante)
     } else {
       liveVisitante = probFavoritoClamp
-      liveLocal = Math.max(0.01, restante)
+      liveLocal = Math.max(0.005, restante)
     }
   }
 
-  // ─── 4) Combinamos el prior (récord general + H2H) con el ajuste en vivo,
-  // dando cada vez más peso al marcador/tiempo en vivo a medida que el
-  // partido avanza. ───
+  // ─── 4) Combinamos el prior (récord general) con el ajuste en vivo, dando
+  // cada vez más peso al marcador/tiempo en vivo a medida que el partido
+  // avanza o aparece diferencia de goles. ───
   const combinado = {
     local: priorLocal * (1 - pesoMarcador) + liveLocal * pesoMarcador,
     empate: priorEmpate * (1 - pesoMarcador) + liveEmpate * pesoMarcador,
@@ -345,22 +364,26 @@ export default function Public() {
   const [teamMatches, setTeamMatches] = useState<MatchDetail[]>([])
   const [realtimeUpdating, setRealtimeUpdating] = useState(false)
 
-  // ─── Historial head-to-head (todos los enfrentamientos históricos entre dos equipos,
-  // sin importar el torneo). Se cachea por par de equipos para no volver a pedirlo. ───
-  // ─── Historial head-to-head (todos los enfrentamientos históricos entre dos equipos,
-  // sin importar el torneo). Se cachea por par de equipos para no volver a pedirlo. ───
-  const [h2hCache, setH2hCache] = useState<Record<string, Partido[]>>({})
-  const [loadingH2h, setLoadingH2h] = useState(false)
-  const [h2hCargado, setH2hCargado] = useState<Record<string, boolean>>({})
-
   // ─── Récord general de cada equipo (victorias/empates/derrotas contra CUALQUIER
   // rival, en cualquier torneo, fase de grupos + eliminatorias). Se usa como estimador
-  // inicial de fuerza de cada equipo, con más peso que el head-to-head directo
-  // (que suele tener muy pocas muestras). Se cachea por equipo_id. ───
+  // inicial de fuerza de cada equipo. Se cachea por equipo_id. ───
   const [recordGeneralCache, setRecordGeneralCache] = useState<Record<string, { victorias: number; empates: number; derrotas: number }>>({})
   const [recordGeneralCargado, setRecordGeneralCargado] = useState<Record<string, boolean>>({})
 
+  // ─── Racha máxima histórica sin perder + forma de los últimos 5 partidos,
+  // por equipo (feature 1). Se cachea por equipo_id. ───
+  const [rachaFormaCache, setRachaFormaCache] = useState<Record<string, RachaYForma>>({})
+  const [rachaFormaCargado, setRachaFormaCargado] = useState<Record<string, boolean>>({})
+
+  // ─── Progresión histórica de goles por intervalos de minutos, por equipo
+  // (feature 4). Se cachea por equipo_id. ───
+  const [progresionGolesCache, setProgresionGolesCache] = useState<Record<string, ProgresionGoles>>({})
+  const [progresionGolesCargado, setProgresionGolesCargado] = useState<Record<string, boolean>>({})
+
   const [h2hExpandido, setH2hExpandido] = useState<Record<string, boolean>>({})
+  const [h2hCache, setH2hCache] = useState<Record<string, Partido[]>>({})
+  const [loadingH2h, setLoadingH2h] = useState(false)
+  const [h2hCargado, setH2hCargado] = useState<Record<string, boolean>>({})
 
   // ─── Ganadores por torneo (equipo campeón, calculado desde el partido de ronda "final") ───
   const [ganadoresTorneo, setGanadoresTorneo] = useState<Record<string, Equipo | null>>({})
@@ -422,7 +445,7 @@ export default function Public() {
       if (et && et.length > 0) {
         const ids = et.map(e => e.equipo_id)
         const { data: eqs } = await supabase
-          .from('equipos').select('id, nombre, escudo_url, color_hex').in('id', ids)
+          .from('equipos').select('id, nombre, escudo_url, color_hex, dt').in('id', ids)
         if (eqs) equiposList = eqs as Equipo[]
       }
       setEquipos(equiposList)
@@ -616,7 +639,6 @@ export default function Public() {
       try {
         const torneoIds = torneos.map(t => t.id)
 
-        // Traemos todos los partidos de "final" (jugados o no) de todos los torneos
         const { data: finales } = await supabase
           .from('partidos')
           .select('torneo_id, equipo_local_id, equipo_visitante_id, goles_local, goles_visitante')
@@ -629,7 +651,6 @@ export default function Public() {
           return
         }
 
-        // Determinamos el id del equipo ganador para cada torneo
         const ganadorIdPorTorneo: Record<string, string | null> = {}
         finales.forEach(f => {
           if (f.goles_local == null || f.goles_visitante == null) return
@@ -647,7 +668,7 @@ export default function Public() {
 
         const { data: equiposGanadores } = await supabase
           .from('equipos')
-          .select('id, nombre, escudo_url, color_hex')
+          .select('id, nombre, escudo_url, color_hex, dt')
           .in('id', equipoIdsGanadores)
 
         const mapaEquipos: Record<string, Equipo> = {}
@@ -734,7 +755,6 @@ export default function Public() {
     const { equipo_local_id, equipo_visitante_id } = detalle.partido
     const key = h2hKey(equipo_local_id, equipo_visitante_id)
 
-    // Si ya está en caché, no volvemos a pedirlo
     if (h2hCache[key]) return
 
     let cancelado = false
@@ -760,22 +780,19 @@ export default function Public() {
 
         const todos = [...(comoLocal || []), ...(comoVisitante || [])] as Partido[]
         todos.sort((a, b) => {
-          // 1) Ordenar por edición del torneo (más reciente primero)
           const numA = torneosMap[a.torneo_id!]?.numero ?? 0
           const numB = torneosMap[b.torneo_id!]?.numero ?? 0
           if (numA !== numB) return numB - numA
-                
-          // 2) Dentro de la misma edición: grupos antes que eliminatorias antes que final
+
           const ordenFase = (p: Partido) => {
             if (p.ronda === 'final') return 2
             if (p.fase === 'eliminatorias') return 1
-            return 0 // grupos
+            return 0
           }
           const faseA = ordenFase(a)
           const faseB = ordenFase(b)
-          if (faseA !== faseB) return faseB - faseA // eliminatorias/final antes que grupos (más reciente primero)
-        
-          // 3) Desempate final: fecha o created_at
+          if (faseA !== faseB) return faseB - faseA
+
           const da = a.fecha ? new Date(a.fecha).getTime() : (a.created_at ? new Date(a.created_at).getTime() : 0)
           const db = b.fecha ? new Date(b.fecha).getTime() : (b.created_at ? new Date(b.created_at).getTime() : 0)
           return db - da
@@ -797,123 +814,122 @@ export default function Public() {
     return () => { cancelado = true }
   }, [expandedMatchId, teamMatches, h2hCache])
 
-  // ─── Cargar historial head-to-head para TODOS los partidos en vivo (para poder
-  // calcular probabilidades de victoria/empate/derrota en la card destacada). ───
-  // IMPORTANTE: se excluye explícitamente el propio partido en vivo (.neq('id', partido.id))
-  // porque, una vez que se marca el primer gol, ese partido pasa a tener goles_local/
-  // goles_visitante no nulos y por lo tanto calificaría para su propia consulta de
-  // historial head-to-head, contaminando el prior histórico con su propio resultado
-  // parcial. Esto es lo que causaba que el % cambiara bruscamente solo al recargar
-  // la página (justo cuando esta consulta se ejecuta de nuevo desde cero).
-  // ─── Cargar historial head-to-head para TODOS los partidos en vivo (para poder
-  // calcular probabilidades de victoria/empate/derrota en la card destacada). ───
-  // IMPORTANTE: se excluye explícitamente el propio partido en vivo (.neq('id', partido.id))
-  // porque, una vez que se marca el primer gol, ese partido pasa a tener goles_local/
-  // goles_visitante no nulos y por lo tanto calificaría para su propia consulta de
-  // historial head-to-head, contaminando el prior histórico con su propio resultado
-  // parcial. Esto es lo que causaba que el % cambiara bruscamente solo al recargar
-  // la página (justo cuando esta consulta se ejecuta de nuevo desde cero).
-  // ─── Cargar historial head-to-head para TODOS los partidos en vivo (para poder
-  // calcular probabilidades de victoria/empate/derrota en la card destacada). ───
-  // IMPORTANTE: se excluye explícitamente el propio partido en vivo (.neq('id', partido.id))
-  // porque, una vez que se marca el primer gol, ese partido pasa a tener goles_local/
-  // goles_visitante no nulos y por lo tanto calificaría para su propia consulta de
-  // historial head-to-head, contaminando el prior histórico con su propio resultado
-  // parcial. Esto es lo que causaba que el % cambiara bruscamente solo al recargar
-  // la página (justo cuando esta consulta se ejecuta de nuevo desde cero).
+  // ─── Para TODOS los partidos en vivo: cargar récord general, racha máxima +
+  // forma reciente, y progresión de goles por intervalos de minutos, para cada
+  // uno de los dos equipos involucrados. Se excluye siempre el propio partido
+  // en vivo (.neq('id', partido.id)) para no contaminar las estadísticas con
+  // su propio resultado parcial mientras está en curso. ───
   useEffect(() => {
     if (partidosEnVivo.length === 0) return
     let cancelado = false
 
-    const cargarH2hEnVivo = async () => {
+    const cargarStatsEnVivo = async () => {
       for (const partido of partidosEnVivo) {
-        const key = h2hKey(partido.equipo_local_id, partido.equipo_visitante_id)
-        if (!h2hCache[key]) {
-          try {
-            const { data: comoLocal } = await supabase
-              .from('partidos')
-              .select('*')
-              .eq('equipo_local_id', partido.equipo_local_id)
-              .eq('equipo_visitante_id', partido.equipo_visitante_id)
-              .not('goles_local', 'is', null)
-              .not('goles_visitante', 'is', null)
-              .neq('id', partido.id)
-
-            const { data: comoVisitante } = await supabase
-              .from('partidos')
-              .select('*')
-              .eq('equipo_local_id', partido.equipo_visitante_id)
-              .eq('equipo_visitante_id', partido.equipo_local_id)
-              .not('goles_local', 'is', null)
-              .not('goles_visitante', 'is', null)
-              .neq('id', partido.id)
-
-            // Filtro de seguridad adicional en memoria, por si en el futuro se
-            // reutiliza este resultado desde otro punto sin pasar por el .neq() de arriba.
-            const todos = [...(comoLocal || []), ...(comoVisitante || [])]
-              .filter(p => p.id !== partido.id) as Partido[]
-
-            if (!cancelado) {
-              setH2hCache(prev => (prev[key] ? prev : { ...prev, [key]: todos }))
-              setH2hCargado(prev => (prev[key] ? prev : { ...prev, [key]: true }))
-            }
-          } catch (error) {
-            console.error('Error cargando historial head-to-head (en vivo):', error)
-          }
-        }
-
-        // ─── Récord general de cada equipo del partido (contra CUALQUIER rival,
-        // cualquier torneo, excluyendo también el propio partido en vivo por la
-        // misma razón explicada arriba: podría autoincluirse una vez tiene goles). ───
         for (const equipoId of [partido.equipo_local_id, partido.equipo_visitante_id]) {
-          if (recordGeneralCache[equipoId]) continue
+          // ─── Récord general (para el prior de probabilidades) ───
+          if (!recordGeneralCache[equipoId]) {
+            try {
+              const { data: comoLocalGen } = await supabase
+                .from('partidos')
+                .select('goles_local, goles_visitante, equipo_local_id, equipo_visitante_id, id, created_at, fecha')
+                .eq('equipo_local_id', equipoId)
+                .not('goles_local', 'is', null)
+                .not('goles_visitante', 'is', null)
+                .neq('id', partido.id)
 
-          try {
-            const { data: comoLocalGen } = await supabase
-              .from('partidos')
-              .select('goles_local, goles_visitante, equipo_local_id, equipo_visitante_id, id')
-              .eq('equipo_local_id', equipoId)
-              .not('goles_local', 'is', null)
-              .not('goles_visitante', 'is', null)
-              .neq('id', partido.id)
+              const { data: comoVisitanteGen } = await supabase
+                .from('partidos')
+                .select('goles_local, goles_visitante, equipo_local_id, equipo_visitante_id, id, created_at, fecha')
+                .eq('equipo_visitante_id', equipoId)
+                .not('goles_local', 'is', null)
+                .not('goles_visitante', 'is', null)
+                .neq('id', partido.id)
 
-            const { data: comoVisitanteGen } = await supabase
-              .from('partidos')
-              .select('goles_local, goles_visitante, equipo_local_id, equipo_visitante_id, id')
-              .eq('equipo_visitante_id', equipoId)
-              .not('goles_local', 'is', null)
-              .not('goles_visitante', 'is', null)
-              .neq('id', partido.id)
+              let victorias = 0, empates = 0, derrotas = 0
+              ;(comoLocalGen || []).forEach(p => {
+                if (p.id === partido.id) return
+                if ((p.goles_local ?? 0) > (p.goles_visitante ?? 0)) victorias++
+                else if ((p.goles_local ?? 0) < (p.goles_visitante ?? 0)) derrotas++
+                else empates++
+              })
+              ;(comoVisitanteGen || []).forEach(p => {
+                if (p.id === partido.id) return
+                if ((p.goles_visitante ?? 0) > (p.goles_local ?? 0)) victorias++
+                else if ((p.goles_visitante ?? 0) < (p.goles_local ?? 0)) derrotas++
+                else empates++
+              })
 
-            let victorias = 0, empates = 0, derrotas = 0
-            ;(comoLocalGen || []).forEach(p => {
-              if (p.id === partido.id) return
-              if ((p.goles_local ?? 0) > (p.goles_visitante ?? 0)) victorias++
-              else if ((p.goles_local ?? 0) < (p.goles_visitante ?? 0)) derrotas++
-              else empates++
-            })
-            ;(comoVisitanteGen || []).forEach(p => {
-              if (p.id === partido.id) return
-              if ((p.goles_visitante ?? 0) > (p.goles_local ?? 0)) victorias++
-              else if ((p.goles_visitante ?? 0) < (p.goles_local ?? 0)) derrotas++
-              else empates++
-            })
+              if (!cancelado) {
+                setRecordGeneralCache(prev => (prev[equipoId] ? prev : { ...prev, [equipoId]: { victorias, empates, derrotas } }))
+                setRecordGeneralCargado(prev => (prev[equipoId] ? prev : { ...prev, [equipoId]: true }))
+              }
 
-            if (!cancelado) {
-              setRecordGeneralCache(prev => (prev[equipoId] ? prev : { ...prev, [equipoId]: { victorias, empates, derrotas } }))
-              setRecordGeneralCargado(prev => (prev[equipoId] ? prev : { ...prev, [equipoId]: true }))
+              // ─── Racha máxima sin perder + forma últimos 5 (a partir de los
+              // mismos partidos, ordenados cronológicamente ascendente) ───
+              const todosOrdenCron = [
+                ...(comoLocalGen || []).map(p => ({ ...p, golesA: p.goles_local, golesB: p.goles_visitante })),
+                ...(comoVisitanteGen || []).map(p => ({ ...p, golesA: p.goles_visitante, golesB: p.goles_local })),
+              ].filter(p => p.id !== partido.id)
+              todosOrdenCron.sort((a, b) => {
+                const da = a.fecha ? new Date(a.fecha).getTime() : (a.created_at ? new Date(a.created_at).getTime() : 0)
+                const db = b.fecha ? new Date(b.fecha).getTime() : (b.created_at ? new Date(b.created_at).getTime() : 0)
+                return da - db
+              })
+              const rachaForma = calcularRachaYForma(todosOrdenCron.map(p => ({ golesA: p.golesA, golesB: p.golesB })))
+              if (!cancelado) {
+                setRachaFormaCache(prev => (prev[equipoId] ? prev : { ...prev, [equipoId]: rachaForma }))
+                setRachaFormaCargado(prev => (prev[equipoId] ? prev : { ...prev, [equipoId]: true }))
+              }
+            } catch (error) {
+              console.error('Error cargando récord/racha general del equipo:', error)
             }
-          } catch (error) {
-            console.error('Error cargando récord general del equipo:', error)
+          }
+
+          // ─── Progresión de goles por intervalos de minutos ───
+          if (!progresionGolesCache[equipoId]) {
+            try {
+              const { data: partidosDelEquipoLocal } = await supabase
+                .from('partidos').select('id')
+                .eq('equipo_local_id', equipoId)
+                .not('goles_local', 'is', null)
+                .neq('id', partido.id)
+              const { data: partidosDelEquipoVisitante } = await supabase
+                .from('partidos').select('id')
+                .eq('equipo_visitante_id', equipoId)
+                .not('goles_local', 'is', null)
+                .neq('id', partido.id)
+
+              const idsPartidosEquipo = Array.from(new Set([
+                ...(partidosDelEquipoLocal || []).map(p => p.id),
+                ...(partidosDelEquipoVisitante || []).map(p => p.id),
+              ]))
+
+              let golesEquipo: { minuto: number }[] = []
+              if (idsPartidosEquipo.length > 0) {
+                const { data: golesData } = await supabase
+                  .from('goles').select('minuto')
+                  .eq('equipo_id', equipoId)
+                  .in('partido_id', idsPartidosEquipo)
+                golesEquipo = golesData || []
+              }
+
+              const progresion = calcularProgresionGoles(golesEquipo)
+              if (!cancelado) {
+                setProgresionGolesCache(prev => (prev[equipoId] ? prev : { ...prev, [equipoId]: progresion }))
+                setProgresionGolesCargado(prev => (prev[equipoId] ? prev : { ...prev, [equipoId]: true }))
+              }
+            } catch (error) {
+              console.error('Error cargando progresión de goles del equipo:', error)
+            }
           }
         }
       }
     }
 
-    cargarH2hEnVivo()
+    cargarStatsEnVivo()
 
     return () => { cancelado = true }
-  }, [partidosEnVivo, h2hCache, recordGeneralCache])
+  }, [partidosEnVivo, recordGeneralCache, progresionGolesCache])
 
   // ─── Reloj en vivo: recalcula cada segundo mientras haya partidos "jugando",
   // para que el tiempo transcurrido y las probabilidades se actualicen solas
@@ -957,7 +973,6 @@ export default function Public() {
       else { local.pe++; visitante.pe++; local.pts += 1; visitante.pts += 1 }
     })
 
-    // Total de power-ups usados por equipo (mismo criterio de desempate que Clasificatoria)
     powerupsUsage.forEach(ep => {
       const stat = statsMap.get(ep.equipo.id)
       if (stat) stat.powerupsUsados = ep.total
@@ -971,9 +986,7 @@ export default function Public() {
       if (b.pts !== a.pts) return b.pts - a.pts
       if (b.dg !== a.dg) return b.dg - a.dg
       if (b.gf !== a.gf) return b.gf - a.gf
-      // Penúltimo criterio de desempate: menos power-ups usados clasifica mejor.
       if (a.powerupsUsados !== b.powerupsUsados) return a.powerupsUsados - b.powerupsUsados
-      // Último criterio, determinista: orden alfabético (igual que en ClasificatoriaGrupos.tsx).
       return (a.equipo?.nombre ?? '').localeCompare(b.equipo?.nombre ?? '')
     })
   }, [equipos, partidosGrupos, powerupsUsage])
@@ -1100,6 +1113,13 @@ export default function Public() {
         }
         .prob-bar-segment {
           transition: width 0.5s ease;
+        }
+        .forma-dot {
+          display: flex; align-items: center; justify-content: center;
+          width: 20px; height: 20px; border-radius: 50%; flex-shrink: 0;
+        }
+        .racha-progresion-row {
+          transition: opacity 0.2s;
         }
 
         @media (max-width: 768px) {
@@ -1237,6 +1257,12 @@ export default function Public() {
             flex-direction: column !important;
             gap: 6px !important;
           }
+          .live-extra-grid {
+            grid-template-columns: 1fr !important;
+          }
+          .progresion-goles-bar-label {
+            font-size: 16px !important;
+          }
         }
       `}</style>
 
@@ -1372,10 +1398,8 @@ export default function Public() {
                 {partidosEnVivo.map(partido => {
                   const local = equipoById(partido.equipo_local_id)
                   const visitante = equipoById(partido.equipo_visitante_id)
-                  obtenerReglasPartido(partido)
+                  const reglas = obtenerReglasPartido(partido)
                   const segundosActuales = segundosEnVivo(partido)
-                  const key = h2hKey(partido.equipo_local_id, partido.equipo_visitante_id)
-                  const h2h = h2hCache[key] || []
                   const recordsListos = !!recordGeneralCargado[partido.equipo_local_id] && !!recordGeneralCargado[partido.equipo_visitante_id]
 
                   // Derivamos el marcador SIEMPRE desde los goles reales (tabla `goles`),
@@ -1391,7 +1415,6 @@ export default function Public() {
                     golesLocal,
                     golesVisitante,
                     segundos: segundosActuales,
-                    h2h,
                     recordLocal: recordGeneralCache[partido.equipo_local_id] || null,
                     recordVisitante: recordGeneralCache[partido.equipo_visitante_id] || null,
                   })
@@ -1409,6 +1432,85 @@ export default function Public() {
                   const colorEmpate = '#9CA3AF'
 
                   const pausado = partido.estado === 'pausado'
+
+                  // ─── Feature 1: racha máxima + forma reciente ───
+                  const rachaLocal = rachaFormaCache[partido.equipo_local_id]
+                  const rachaVisitante = rachaFormaCache[partido.equipo_visitante_id]
+                  const rachaListas = !!rachaFormaCargado[partido.equipo_local_id] && !!rachaFormaCargado[partido.equipo_visitante_id]
+
+                  // ─── Feature 4: progresión de goles por intervalos ───
+                  const progresionLocal = progresionGolesCache[partido.equipo_local_id]
+                  const progresionVisitante = progresionGolesCache[partido.equipo_visitante_id]
+                  const progresionLista = !!progresionGolesCargado[partido.equipo_local_id] && !!progresionGolesCargado[partido.equipo_visitante_id]
+
+                  const FormaDot = ({ resultado }: { resultado: 'V' | 'E' | 'D' }) => {
+                    const cfg = {
+                      V: { bg: 'rgba(0,200,140,0.16)', border: 'rgba(0,200,140,0.55)', color: 'rgb(0,200,140)' },
+                      D: { bg: 'rgba(255,77,77,0.16)', border: 'rgba(255,77,77,0.55)', color: 'rgb(255,77,77)' },
+                      E: { bg: 'rgba(255,255,255,0.08)', border: 'rgba(255,255,255,0.28)', color: 'rgba(255,255,255,0.65)' },
+                    }[resultado]
+                    return (
+                      <span style={{
+                        width: 22, height: 22, borderRadius: '50%', flexShrink: 0,
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        background: cfg.bg, border: `1.5px solid ${cfg.border}`,
+                      }}>
+                        {resultado === 'V' && <Check size={12} color={cfg.color} strokeWidth={3} />}
+                        {resultado === 'D' && <XIcon size={12} color={cfg.color} strokeWidth={3} />}
+                        {resultado === 'E' && <span style={{ width: 6, height: 6, borderRadius: '50%', background: cfg.color }} />}
+                      </span>
+                    )
+                  }
+
+                  const RachaFormaBloque = ({ equipo, racha, alinear }: { equipo: Equipo | undefined; racha: RachaYForma | undefined; alinear: 'flex-start' | 'flex-end' }) => (
+                    <div style={{
+                      flex: 1, display: 'flex', flexDirection: 'column', gap: 10,
+                      alignItems: alinear,
+                      padding: '14px 16px',
+                      borderRadius: 12,
+                      background: 'rgba(255,255,255,0.03)',
+                      border: '1px solid rgba(255,255,255,0.08)',
+                    }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexDirection: alinear === 'flex-end' ? 'row-reverse' : 'row' }}>
+                        {equipo?.escudo_url
+                          ? <img src={equipo.escudo_url} style={{ width: 18, height: 18, objectFit: 'contain', flexShrink: 0 }} />
+                          : <div style={{ width: 18, height: 18, borderRadius: 4, background: 'var(--color-border)', flexShrink: 0 }} />
+                        }
+                        <span style={{ fontSize: 11, fontWeight: 700, color: 'rgba(255,255,255,0.55)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                          {equipo?.nombre ?? ''}
+                        </span>
+                      </div>
+
+                      <div style={{ display: 'flex', gap: 5, flexDirection: alinear === 'flex-end' ? 'row-reverse' : 'row' }}>
+                        {racha && racha.ultimos5.length > 0 ? (
+                          racha.ultimos5.map((r, i) => <FormaDot key={i} resultado={r} />)
+                        ) : (
+                          <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.3)' }}>Sin historial</span>
+                        )}
+                      </div>
+
+                      <div style={{
+                        display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8,
+                        paddingTop: 10, marginTop: 2,
+                        borderTop: '1px solid rgba(255,255,255,0.06)',
+                        width: '100%',
+                      }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                          <Trophy size={12} color="#FFC800" />
+                          <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.5)' }}>
+                            Racha invicta máx.
+                          </span>
+                        </div>
+                        <span style={{
+                          fontSize: 12, fontWeight: 800, color: '#FFC800',
+                          background: 'rgba(255,200,0,0.14)', borderRadius: 6,
+                          padding: '2px 8px', lineHeight: 1.3,
+                        }}>
+                          {racha ? racha.rachaMaxima : '–'}
+                        </span>
+                      </div>
+                    </div>
+                  )
 
                   return (
                     <div key={partido.id} className="live-match-card">
@@ -1438,9 +1540,11 @@ export default function Public() {
                             </span>
                           )}
                         </div>
+                        {/* Feature 5: timer con "/ límite" al lado */}
                         <div style={{ display: 'flex', alignItems: 'center', gap: '14px', fontSize: '12px', color: 'rgba(255,255,255,0.5)', fontWeight: 600 }}>
                           <span style={{ fontFamily: 'monospace', fontSize: '15px', color: 'var(--color-textWH)', fontWeight: 700, letterSpacing: '1px' }}>
                             {formatearDuracion(segundosActuales)}
+                            <span style={{ color: 'rgba(255,255,255,0.4)', fontWeight: 600 }}> / {formatearDuracion(reglas.duracionMax)}</span>
                           </span>
                         </div>
                       </div>
@@ -1457,6 +1561,12 @@ export default function Public() {
                             <span className="live-match-team-name" style={{ fontSize: 16, fontWeight: 700, color: 'var(--color-textWH)', textAlign: 'center' }}>
                               {local?.nombre ?? '—'}
                             </span>
+                            {/* Feature 3: DT */}
+                            {local?.dt && (
+                              <span style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: 'rgba(255,255,255,0.45)' }}>
+                                <User size={11} /> {local.dt}
+                              </span>
+                            )}
                             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2, minHeight: 16 }}>
                               {golesLocalList.map((t, i) => (
                                 <span key={i} style={{ fontSize: 11, color: 'rgba(255,255,255,0.5)' }}>⚽ {t}</span>
@@ -1494,6 +1604,12 @@ export default function Public() {
                             <span className="live-match-team-name" style={{ fontSize: 16, fontWeight: 700, color: 'var(--color-textWH)', textAlign: 'center' }}>
                               {visitante?.nombre ?? '—'}
                             </span>
+                            {/* Feature 3: DT */}
+                            {visitante?.dt && (
+                              <span style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: 'rgba(255,255,255,0.45)' }}>
+                                <User size={11} /> {visitante.dt}
+                              </span>
+                            )}
                             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2, minHeight: 16 }}>
                               {golesVisitanteList.map((t, i) => (
                                 <span key={i} style={{ fontSize: 11, color: 'rgba(255,255,255,0.5)' }}>⚽ {t}</span>
@@ -1513,12 +1629,12 @@ export default function Public() {
                         </div>
                       </div>
 
-                      {/* Probabilidad de victoria */}
+                      {/* Probabilidad de victoria (feature 2: labels debajo de cada %, feature 6: nuevo algoritmo) */}
                       <div style={{ padding: '4px 28px 22px' }}>
                         <div style={{ fontSize: 11, fontWeight: 700, color: 'rgba(255,255,255,0.45)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8, textAlign: 'center' }}>
                           Probabilidad de resultado
                         </div>
-                        {h2hCargado[key] && recordsListos ? (
+                        {recordsListos ? (
                           <>
                             <div style={{
                               display: 'flex', width: '100%', height: 14, borderRadius: 8, overflow: 'hidden',
@@ -1531,12 +1647,21 @@ export default function Public() {
                             <div className="live-prob-row" style={{ display: 'flex', width: '100%', marginTop: 4 }}>
                               <div style={{ width: `${probs.local}%`, textAlign: 'center' }}>
                                 <span style={{ fontSize: 14, fontWeight: 800, color: colorLocal }}>{probs.local}%</span>
+                                <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.5)', fontWeight: 600, marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                  {local?.nombre ?? 'Local'}
+                                </div>
                               </div>
                               <div style={{ width: `${probs.empate}%`, textAlign: 'center' }}>
                                 <span style={{ fontSize: 14, fontWeight: 800, color: colorEmpate }}>{probs.empate}%</span>
+                                <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.5)', fontWeight: 600, marginTop: 2 }}>
+                                  Empate
+                                </div>
                               </div>
                               <div style={{ width: `${probs.visitante}%`, textAlign: 'center' }}>
                                 <span style={{ fontSize: 14, fontWeight: 800, color: colorVisitante }}>{probs.visitante}%</span>
+                                <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.5)', fontWeight: 600, marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                  {visitante?.nombre ?? 'Visitante'}
+                                </div>
                               </div>
                             </div>
                           </>
@@ -1547,6 +1672,90 @@ export default function Public() {
                           }}>
                             <Loader2 size={14} className="spin" />
                             Calculando probabilidades...
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Feature 1: racha máxima invicta + forma últimos 5 partidos */}
+                      <div style={{ padding: '0 28px 20px', borderTop: '1px solid rgba(255,255,255,0.08)' }}>
+                        <div style={{ paddingTop: 16, display: 'flex', gap: 12 }}>
+                          {rachaListas ? (
+                            <>
+                              <RachaFormaBloque equipo={local} racha={rachaLocal} alinear="flex-start" />
+                              <RachaFormaBloque equipo={visitante} racha={rachaVisitante} alinear="flex-end" />
+                            </>
+                          ) : (
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'rgba(255,255,255,0.4)', fontSize: 12, margin: '0 auto', padding: '14px' }}>
+                              <Loader2 size={14} className="spin" />
+                              Cargando racha y forma...
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Feature 4: progresión de goles por intervalos de minutos */}
+                      <div style={{ padding: '0 28px 26px', borderTop: '1px solid rgba(255,255,255,0.08)' }}>
+                        <div style={{ paddingTop: 16, fontSize: 12, fontWeight: 800, color: 'rgba(255,255,255,0.6)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 14, textAlign: 'center' }}>
+                          Progresión de goles por intervalos de minutos
+                        </div>
+                        {progresionLista && progresionLocal && progresionVisitante ? (
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
+                            {[
+                              { equipo: local, progresion: progresionLocal },
+                              { equipo: visitante, progresion: progresionVisitante },
+                            ].map(({ equipo, progresion }, rowIdx) => {
+                              const totalGoles = progresion.conteos.reduce((a, b) => a + b, 0)
+                              const ANCHO_MIN_PCT = 2
+                              const anchoDisponible = 100 - ANCHO_MIN_PCT * INTERVALOS_GOLES.length
+                              const anchosPct = progresion.conteos.map(c =>
+                                totalGoles > 0
+                                  ? ANCHO_MIN_PCT + (c / totalGoles) * anchoDisponible
+                                  : 100 / INTERVALOS_GOLES.length
+                              )
+                              return (
+                                <div key={rowIdx} style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                                  {equipo?.escudo_url
+                                    ? <img src={equipo.escudo_url} style={{ width: 30, height: 30, objectFit: 'contain', flexShrink: 0 }} />
+                                    : <div style={{ width: 30, height: 30, borderRadius: 6, background: 'var(--color-border)', flexShrink: 0 }} />
+                                  }
+                                  <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                                    <div style={{ display: 'flex', gap: 4 }}>
+                                      {INTERVALOS_GOLES.map((iv, i) => {
+                                        const conteo = progresion.conteos[i]
+                                        return (
+                                          <div
+                                            key={iv.label}
+                                            style={{
+                                              width: `${anchosPct[i]}%`,
+                                              transition: 'width 0.4s ease',
+                                              display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3,
+                                              minWidth: 0,
+                                            }}
+                                          >
+                                            <span className="progresion-goles-bar-label" style={{ fontSize: 13, fontWeight: 700, color: 'var(--color-textWH)' }}>{conteo}</span>
+                                            <div style={{ width: '100%', height: 6, borderRadius: 4, background: INTERVALO_COLORES[i] }} />
+                                          </div>
+                                        )
+                                      })}
+                                    </div>
+                                  </div>
+                                </div>
+                              )
+                            })}
+                            {/* Leyenda de intervalos */}
+                            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12, justifyContent: 'center', paddingTop: 4 }}>
+                              {INTERVALOS_GOLES.map((iv, i) => (
+                                <span key={iv.label} style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, color: 'rgba(255,255,255,0.5)' }}>
+                                  <span style={{ width: 9, height: 9, borderRadius: '50%', background: INTERVALO_COLORES[i], display: 'inline-block' }} />
+                                  {iv.label}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        ) : (
+                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, color: 'rgba(255,255,255,0.4)', fontSize: 12, padding: '10px' }}>
+                            <Loader2 size={14} className="spin" />
+                            Cargando progresión de goles...
                           </div>
                         )}
                       </div>
@@ -1563,7 +1772,6 @@ export default function Public() {
                   <Calendar size={22} color="var(--color-accent)" />
                   <h2 style={{ fontSize: '20px', fontWeight: '700', margin: 0 }}>Jornadas</h2>
                 </div>
-                {/* Wrapper con scroll horizontal en mobile */}
                 <div className="jornada-scroll-wrapper">
                   <div className="jornada-row">
                     {jornadas.map(jornada => {
@@ -1813,11 +2021,6 @@ export default function Public() {
                       const isExpanded = expandedMatchId === detail.partido.id
 
                       const key = h2hKey(detail.partido.equipo_local_id, detail.partido.equipo_visitante_id)
-                      // ─── FIX: `h2hTodos` incluye el partido actual (detail.partido) y se usa
-                      // para el RESUMEN de victorias/empates/derrotas y sus porcentajes, para que
-                      // el resultado de la card contenedora sí se tenga en cuenta en el conteo.
-                      // `h2hPartidos` incluye el partido actual (primero, resaltado) más el resto
-                      // del historial, ya que ahora también debe mostrarse dentro del listado. ───
                       const h2hTodos = h2hCache[key] || []
                       const h2hPartidos = [...h2hTodos].sort((a, b) => {
                         if (a.id === detail.partido.id) return -1
@@ -2074,11 +2277,6 @@ export default function Public() {
                                     </div>
                                   ) : (
                                     <>
-                                      {/* Resumen de victorias / empates / derrotas, desde la perspectiva
-                                          del equipo "local" de la card actual.
-                                          IMPORTANTE: se itera sobre `h2hTodos` (incluye el propio
-                                          partido de esta card), no sobre `h2hPartidos`, para que el
-                                          resultado de la card contenedora sí se refleje en el conteo. */}
                                       {(() => {
                                         let vLocal = 0, empates = 0, vVisitante = 0
                                         h2hTodos.forEach(hp => {
@@ -2135,8 +2333,6 @@ export default function Public() {
                                         <>
                                         <div className={`h2h-scroll ${h2hExpandido[detail.partido.id] ? 'h2h-full' : ''}`} style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                                           {h2hPartidos.map(hp => {
-                                            // Reordenar para que siempre se muestre desde la perspectiva
-                                            // del "local" de la card actual (detail.partido)
                                             const esMismoOrden = hp.equipo_local_id === detail.partido.equipo_local_id
                                             const gLocalRef = esMismoOrden ? hp.goles_local : hp.goles_visitante
                                             const gVisitanteRef = esMismoOrden ? hp.goles_visitante : hp.goles_local
@@ -2197,7 +2393,6 @@ export default function Public() {
                                                   </span>
                                                 </div>
 
-                                                {/* Edición del torneo en el que ocurrió este partido */}
                                                 {hpEdicion && (
                                                   <span style={{
                                                     flexShrink: 0,
@@ -2213,7 +2408,6 @@ export default function Public() {
                                                   </span>
                                                 )}
 
-                                                {/* Letra de fase: G = grupos, E = eliminatoria, F = final */}
                                                 {hpFase && (
                                                   <span title={hpFase.letra === 'G' ? 'Fase de grupos' : hpFase.letra === 'E' ? 'Eliminatoria' : 'Final'} style={{
                                                     flexShrink: 0,
@@ -2247,7 +2441,6 @@ export default function Public() {
                                         </>
                                       )}
 
-                                      {/* Leyenda de letras de fase */}
                                       <div style={{
                                         display: 'flex', alignItems: 'center', justifyContent: 'center', flexWrap: 'wrap',
                                         gap: '10px', marginTop: 10, paddingTop: 8,
