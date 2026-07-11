@@ -383,7 +383,7 @@ export default function Public() {
   const [h2hExpandido, setH2hExpandido] = useState<Record<string, boolean>>({})
   const [h2hCache, setH2hCache] = useState<Record<string, Partido[]>>({})
   const [loadingH2h, setLoadingH2h] = useState(false)
-  const [h2hCargado, setH2hCargado] = useState<Record<string, boolean>>({})
+  const [, setH2hCargado] = useState<Record<string, boolean>>({})
 
   // ─── Ganadores por torneo (equipo campeón, calculado desde el partido de ronda "final") ───
   const [ganadoresTorneo, setGanadoresTorneo] = useState<Record<string, Equipo | null>>({})
