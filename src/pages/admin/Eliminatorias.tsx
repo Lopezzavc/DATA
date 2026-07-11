@@ -150,6 +150,10 @@ export default function Eliminatorias() {
   const [powerupsUsados, setPowerupsUsados] = useState<PowerupUsado[]>([])
   const [modalPowerup, setModalPowerup] = useState<{ equipoId: string; equipoNombre: string } | null>(null)
 
+  // ─── Power-ups en el modal de editar partido ───
+  const [powerupsEditando, setPowerupsEditando] = useState<PowerupUsado[]>([])
+  const [modalPowerupEditar, setModalPowerupEditar] = useState<{ equipoId: string; equipoNombre: string } | null>(null)
+
   const [showFieldModal, setShowFieldModal] = useState(false)
   const [pendingGoal, setPendingGoal] = useState<{ equipoId: string } | null>(null)
   const [markerPos, setMarkerPos] = useState({ x: 50, y: 50 })
@@ -442,7 +446,7 @@ export default function Eliminatorias() {
   }
 
   // ─── Funciones de edición, reinicio, etc. ───
-  const abrirEditar = (partido: Partido) => {
+  const abrirEditar = async (partido: Partido) => {
     const fecha = partido.fecha ? new Date(partido.fecha).toISOString().slice(0, 10) : ''
     setEditando({
       partidoId: partido.id,
@@ -451,6 +455,12 @@ export default function Eliminatorias() {
       fecha,
       usarFechaTorneo: false,
     })
+
+    const { data: powerupsData } = await supabase
+      .from('powerups_usados')
+      .select('*')
+      .eq('partido_id', partido.id)
+    setPowerupsEditando((powerupsData as PowerupUsado[]) || [])
   }
 
   const guardarPartido = async () => {
@@ -464,6 +474,57 @@ export default function Eliminatorias() {
     await fetchData()
     setGuardando(false)
     setEditando(null)
+  }
+
+  // --- Power-ups dentro del modal de editar partido ---
+  const usarPowerupEditando = async (equipoId: string, powerupId: string) => {
+    if (!editando) return
+    const existente = powerupsEditando.find(
+      pu => pu.equipo_id === equipoId && pu.powerup_id === powerupId
+    )
+    if (existente) {
+      const nuevaCantidad = existente.cantidad + 1
+      await supabase
+        .from('powerups_usados')
+        .update({ cantidad: nuevaCantidad })
+        .eq('id', existente.id)
+      setPowerupsEditando(prev =>
+        prev.map(pu => (pu.id === existente.id ? { ...pu, cantidad: nuevaCantidad } : pu))
+      )
+    } else {
+      const { data } = await supabase
+        .from('powerups_usados')
+        .insert({
+          partido_id: editando.partidoId,
+          equipo_id: equipoId,
+          powerup_id: powerupId,
+          cantidad: 1,
+        })
+        .select()
+        .single()
+      if (data) setPowerupsEditando(prev => [...prev, data as PowerupUsado])
+    }
+  }
+
+  const restarPowerupEditando = async (registro: PowerupUsado) => {
+    if (registro.cantidad > 1) {
+      const nuevaCantidad = registro.cantidad - 1
+      await supabase
+        .from('powerups_usados')
+        .update({ cantidad: nuevaCantidad })
+        .eq('id', registro.id)
+      setPowerupsEditando(prev =>
+        prev.map(pu => (pu.id === registro.id ? { ...pu, cantidad: nuevaCantidad } : pu))
+      )
+    } else {
+      await supabase.from('powerups_usados').delete().eq('id', registro.id)
+      setPowerupsEditando(prev => prev.filter(pu => pu.id !== registro.id))
+    }
+  }
+
+  const eliminarPowerupEditando = async (registro: PowerupUsado) => {
+    await supabase.from('powerups_usados').delete().eq('id', registro.id)
+    setPowerupsEditando(prev => prev.filter(pu => pu.id !== registro.id))
   }
 
   const confirmarReiniciar = (partido: Partido) => setReiniciarModal(partido)
@@ -1031,11 +1092,11 @@ export default function Eliminatorias() {
         const local = partido ? equipoById(partido.equipo_local_id) : null
         const visitante = partido ? equipoById(partido.equipo_visitante_id) : null
         return (
-          <div style={OVERLAY} onClick={() => setEditando(null)}>
+          <div style={OVERLAY} onClick={() => { setEditando(null); setPowerupsEditando([]) }}>
             <div style={MODAL} onClick={e => e.stopPropagation()}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                 <span style={{ fontWeight: '700', fontSize: '16px', color: 'var(--color-textWH)' }}>Editar partido</span>
-                <button onClick={() => setEditando(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'rgba(255,255,255,0.4)' }}><X size={16} /></button>
+                <button onClick={() => { setEditando(null); setPowerupsEditando([]) }} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'rgba(255,255,255,0.4)' }}><X size={16} /></button>
               </div>
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '16px' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
@@ -1093,6 +1154,143 @@ export default function Eliminatorias() {
                   onChange={e => setEditando(ed => ed ? { ...ed, fecha: e.target.value } : ed)}
                 />
               </div>
+
+              {/* Power-ups del partido */}
+              <div>
+                <p style={LABEL}>Power-ups</p>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+                  {/* Local */}
+                  <div>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
+                      <span style={{ fontSize: '13px', fontWeight: '700', color: 'var(--color-textWH)' }}>
+                        {local?.nombre ?? '—'}
+                      </span>
+                      <button
+                        onClick={() => setModalPowerupEditar({ equipoId: partido!.equipo_local_id, equipoNombre: local?.nombre ?? '' })}
+                        style={{
+                          display: 'flex', alignItems: 'center', gap: '6px',
+                          padding: '6px 10px', borderRadius: '8px',
+                          background: 'rgba(255,200,0,0.15)', border: '1px solid rgba(255,200,0,0.4)',
+                          color: '#FFC800', fontSize: '12px', fontWeight: '600', cursor: 'pointer',
+                        }}
+                      >
+                        <Zap size={13} />
+                        Agregar
+                      </button>
+                    </div>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+                      {powerupsEditando.filter(pu => pu.equipo_id === partido!.equipo_local_id).length === 0 && (
+                        <span style={{ fontSize: '12px', color: 'rgba(255,255,255,0.3)' }}>Sin power-ups</span>
+                      )}
+                      {powerupsEditando
+                        .filter(pu => pu.equipo_id === partido!.equipo_local_id)
+                        .map(pu => {
+                          const cat = powerupsCatalogo.find(c => c.id === pu.powerup_id)
+                          if (!cat) return null
+                          return (
+                            <div key={pu.id} style={{
+                              display: 'flex', alignItems: 'center', gap: '6px',
+                              padding: '6px 8px', borderRadius: '8px',
+                              background: 'var(--color-background)', border: '1px solid var(--color-border)',
+                            }}>
+                              <img src={POWERUP_IMAGES[cat.nombre] ?? ''} alt={cat.nombre} style={{ width: 18, height: 18, objectFit: 'contain' }} />
+                              <span style={{ fontSize: '12px', color: 'var(--color-textWH)', fontWeight: 600 }}>{cat.nombre} x{pu.cantidad}</span>
+                              <button
+                                onClick={() => restarPowerupEditando(pu)}
+                                title="Quitar uno"
+                                style={{
+                                  width: '20px', height: '20px', borderRadius: '5px',
+                                  background: 'rgba(255,200,0,0.15)', border: 'none',
+                                  color: '#FFC800', fontSize: '13px', fontWeight: '700',
+                                  cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                }}
+                              >
+                                −
+                              </button>
+                              <button
+                                onClick={() => eliminarPowerupEditando(pu)}
+                                title="Eliminar power-up"
+                                style={{
+                                  width: '20px', height: '20px', borderRadius: '5px',
+                                  background: 'rgba(220,50,50,0.15)', border: 'none',
+                                  color: 'var(--color-error)', cursor: 'pointer',
+                                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                }}
+                              >
+                                <X size={12} />
+                              </button>
+                            </div>
+                          )
+                        })}
+                    </div>
+                  </div>
+                  {/* Visitante */}
+                  <div>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
+                      <span style={{ fontSize: '13px', fontWeight: '700', color: 'var(--color-textWH)' }}>
+                        {visitante?.nombre ?? '—'}
+                      </span>
+                      <button
+                        onClick={() => setModalPowerupEditar({ equipoId: partido!.equipo_visitante_id, equipoNombre: visitante?.nombre ?? '' })}
+                        style={{
+                          display: 'flex', alignItems: 'center', gap: '6px',
+                          padding: '6px 10px', borderRadius: '8px',
+                          background: 'rgba(255,200,0,0.15)', border: '1px solid rgba(255,200,0,0.4)',
+                          color: '#FFC800', fontSize: '12px', fontWeight: '600', cursor: 'pointer',
+                        }}
+                      >
+                        <Zap size={13} />
+                        Agregar
+                      </button>
+                    </div>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+                      {powerupsEditando.filter(pu => pu.equipo_id === partido!.equipo_visitante_id).length === 0 && (
+                        <span style={{ fontSize: '12px', color: 'rgba(255,255,255,0.3)' }}>Sin power-ups</span>
+                      )}
+                      {powerupsEditando
+                        .filter(pu => pu.equipo_id === partido!.equipo_visitante_id)
+                        .map(pu => {
+                          const cat = powerupsCatalogo.find(c => c.id === pu.powerup_id)
+                          if (!cat) return null
+                          return (
+                            <div key={pu.id} style={{
+                              display: 'flex', alignItems: 'center', gap: '6px',
+                              padding: '6px 8px', borderRadius: '8px',
+                              background: 'var(--color-background)', border: '1px solid var(--color-border)',
+                            }}>
+                              <img src={POWERUP_IMAGES[cat.nombre] ?? ''} alt={cat.nombre} style={{ width: 18, height: 18, objectFit: 'contain' }} />
+                              <span style={{ fontSize: '12px', color: 'var(--color-textWH)', fontWeight: 600 }}>{cat.nombre} x{pu.cantidad}</span>
+                              <button
+                                onClick={() => restarPowerupEditando(pu)}
+                                title="Quitar uno"
+                                style={{
+                                  width: '20px', height: '20px', borderRadius: '5px',
+                                  background: 'rgba(255,200,0,0.15)', border: 'none',
+                                  color: '#FFC800', fontSize: '13px', fontWeight: '700',
+                                  cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                }}
+                              >
+                                −
+                              </button>
+                              <button
+                                onClick={() => eliminarPowerupEditando(pu)}
+                                title="Eliminar power-up"
+                                style={{
+                                  width: '20px', height: '20px', borderRadius: '5px',
+                                  background: 'rgba(220,50,50,0.15)', border: 'none',
+                                  color: 'var(--color-error)', cursor: 'pointer',
+                                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                }}
+                              >
+                                <X size={12} />
+                              </button>
+                            </div>
+                          )
+                        })}
+                    </div>
+                  </div>
+                </div>
+              </div>
               <button onClick={guardarPartido} disabled={guardando} style={{
                 display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px',
                 padding: '12px', borderRadius: '11px', background: 'var(--color-accent)',
@@ -1105,6 +1303,50 @@ export default function Eliminatorias() {
           </div>
         )
       })()}
+
+      {/* Modal seleccionar power-up a agregar (dentro de editar partido) */}
+      {modalPowerupEditar && (
+        <div style={{ ...OVERLAY, zIndex: 1100 }} onClick={() => setModalPowerupEditar(null)}>
+          <div style={{ ...MODAL, maxWidth: '500px' }} onClick={e => e.stopPropagation()}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <span style={{ fontWeight: 700, fontSize: 16, color: 'var(--color-textWH)' }}>
+                Power-ups para {modalPowerupEditar.equipoNombre}
+              </span>
+              <button
+                onClick={() => setModalPowerupEditar(null)}
+                style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'rgba(255,255,255,0.4)' }}
+              >
+                <X size={16} />
+              </button>
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', marginTop: '8px' }}>
+              {powerupsCatalogo.map(pu => (
+                <button
+                  key={pu.id}
+                  onClick={() => {
+                    usarPowerupEditando(modalPowerupEditar.equipoId, pu.id)
+                    setModalPowerupEditar(null)
+                  }}
+                  style={{
+                    display: 'flex', flexDirection: 'row', alignItems: 'center', gap: 12,
+                    padding: '8px 10px', borderRadius: 8, background: 'transparent',
+                    border: 'none', cursor: 'pointer', textAlign: 'left',
+                  }}
+                >
+                  <img
+                    src={POWERUP_IMAGES[pu.nombre] ?? ''}
+                    alt={pu.nombre}
+                    style={{ width: 32, height: 32, objectFit: 'contain', flexShrink: 0 }}
+                  />
+                  <span style={{ fontSize: 14, color: 'var(--color-textWH)', fontWeight: 600 }}>
+                    {pu.nombre}
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
 
       {reiniciarModal && (
         <div style={OVERLAY} onClick={() => setReiniciarModal(null)}>
