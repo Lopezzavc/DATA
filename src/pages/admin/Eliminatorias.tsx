@@ -1,6 +1,7 @@
 import { useEffect, useState, useRef, useCallback } from 'react'
 import {
-  Loader2, Save, Edit3, X, Play, Pause, Square, RotateCcw, Zap, Trophy, Settings
+  Loader2, Save, Edit3, X, Play, Pause, Square, RotateCcw, Zap, Trophy, Settings,
+  Calendar, ChevronDown
 } from 'lucide-react'
 import { supabase } from '../../lib/supabase'
 import { useTorneo } from '../../context/TorneoContext'
@@ -27,6 +28,7 @@ interface Equipo {
 
 interface Partido {
   id: string
+  torneo_id: string
   equipo_local_id: string
   equipo_visitante_id: string
   goles_local: number | null
@@ -36,6 +38,11 @@ interface Partido {
   duracion_segundos: number
   ronda: string
   grupo_eliminatorio: number | null
+  fase: string
+  numero_llave: number | null
+  inicio_timestamp: string | null
+  created_at: string
+  confirmado: boolean
 }
 
 interface Gol {
@@ -53,6 +60,17 @@ interface Editando {
   goles_visitante: string
   fecha: string
   usarFechaTorneo: boolean
+  estado: string
+  duracion_segundos: number
+  fase: string
+  numero_llave: string
+  ronda: string
+  grupo_eliminatorio: string
+  inicio_timestamp: string
+  created_at: string
+  confirmado: boolean
+  equipo_local_id: string
+  equipo_visitante_id: string
 }
 
 interface CatalogoPowerup {
@@ -123,6 +141,25 @@ const SELECT_STYLE: React.CSSProperties = {
   cursor: 'pointer',
 }
 
+// Funciones de formateo / parseo de fechas (mismas que en PartidosGrupo)
+const formatDateForInput = (isoString: string | null, withTime: boolean): string => {
+  if (!isoString) return ''
+  const d = new Date(isoString)
+  if (isNaN(d.getTime())) return ''
+  const pad = (n: number) => n.toString().padStart(2, '0')
+  const datePart = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+  if (!withTime) return datePart
+  return `${datePart} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+}
+
+const parseDateFromInput = (value: string, withTime: boolean): string | null => {
+  if (!value.trim()) return null
+  const normalized = withTime ? value.replace(' ', 'T') : value
+  const d = new Date(normalized)
+  if (isNaN(d.getTime())) return null
+  return d.toISOString()
+}
+
 export default function Eliminatorias() {
   const { torneoSeleccionado } = useTorneo()
   const [equipos, setEquipos] = useState<Equipo[]>([])
@@ -132,6 +169,7 @@ export default function Eliminatorias() {
   const [editando, setEditando] = useState<Editando | null>(null)
   const [guardando, setGuardando] = useState(false)
   const [confirmModal, setConfirmModal] = useState(false)
+  const [mostrarAvanzado, setMostrarAvanzado] = useState(true)
 
   // ─── Estados del panel en vivo ───
   const [partidoEnVivo, setPartidoEnVivo] = useState<Partido | null>(null)
@@ -173,7 +211,6 @@ export default function Eliminatorias() {
     if (!torneo) return
     setLoading(true)
 
-    // Equipos del torneo
     const { data: eqTorneo } = await supabase
       .from('equipos_torneo').select('equipo_id').eq('torneo_id', torneo.id)
     if (eqTorneo && eqTorneo.length > 0) {
@@ -183,7 +220,6 @@ export default function Eliminatorias() {
       if (eqs) setEquipos(eqs)
     }
 
-    // Partidos eliminatorios ya existentes
     const { data: partidos } = await supabase
       .from('partidos')
       .select('*')
@@ -214,7 +250,7 @@ export default function Eliminatorias() {
   // ─── Sincroniza la fecha del partido con la fecha del torneo cuando el checkbox está activo ───
   useEffect(() => {
     if (editando?.usarFechaTorneo && torneo?.created_at) {
-      const fechaTorneo = new Date(torneo.created_at).toISOString().slice(0, 10)
+      const fechaTorneo = formatDateForInput(torneo.created_at, false)
       setEditando(ed => (ed && ed.fecha !== fechaTorneo ? { ...ed, fecha: fechaTorneo } : ed))
     }
   }, [editando?.usarFechaTorneo, torneo?.created_at])
@@ -254,7 +290,6 @@ export default function Eliminatorias() {
       })
       .slice(0, 4)
 
-    // El orden del array resultante ES el orden de la tabla: [1º, 2º, 3º, 4º]
     return clasificados.map(c => equipos.find(e => e.id === c.id)!).filter(Boolean)
   }
 
@@ -262,14 +297,9 @@ export default function Eliminatorias() {
   const insertarLlaves = async (llave1: ManualLlave, llave2: ManualLlave) => {
     if (!torneo) return
 
-    // Eliminar partidos anteriores de eliminatorias (incluida la final)
     await supabase.from('partidos').delete().eq('torneo_id', torneo.id).eq('fase', 'eliminatorias')
 
-    const insertarPartido = async (
-      localId: string,
-      visitanteId: string,
-      grupo: number
-    ) => {
+    const insertarPartido = async (localId: string, visitanteId: string, grupo: number) => {
       const { error } = await supabase.from('partidos').insert({
         torneo_id: torneo.id,
         fase: 'eliminatorias',
@@ -283,16 +313,14 @@ export default function Eliminatorias() {
       if (error) throw error
     }
 
-    // Llave 1 (Semifinal 1: 1º vs 3º)
-    await insertarPartido(llave1.local, llave1.visitante, 1) // ida
-    await insertarPartido(llave1.visitante, llave1.local, 1) // vuelta
+    await insertarPartido(llave1.local, llave1.visitante, 1)
+    await insertarPartido(llave1.visitante, llave1.local, 1)
 
-    // Llave 2 (Semifinal 2: 2º vs 4º)
-    await insertarPartido(llave2.local, llave2.visitante, 2) // ida
-    await insertarPartido(llave2.visitante, llave2.local, 2) // vuelta
+    await insertarPartido(llave2.local, llave2.visitante, 2)
+    await insertarPartido(llave2.visitante, llave2.local, 2)
   }
 
-  // ─── Generar partidos eliminatorios automáticamente: SIEMPRE 1º vs 3º y 2º vs 4º ───
+  // ─── Generar partidos eliminatorios automáticamente ───
   const generarPartidos = async () => {
     if (!torneo || equipos.length < 4) return
     setGenerando(true)
@@ -300,17 +328,14 @@ export default function Eliminatorias() {
     try {
       const top4 = await obtenerTop4()
       if (top4.length < 4) {
-        alert('No se pudieron determinar los 4 primeros equipos. Asegúrate de que existan partidos de grupo jugados.')
+        alert('No se pudieron determinar los 4 primeros equipos.')
         setGenerando(false)
         return
       }
-
-      // Garantizado: top4[0]=1º, top4[1]=2º, top4[2]=3º, top4[3]=4º
-      const llave1: ManualLlave = { local: top4[0].id, visitante: top4[2].id } // Semifinal 1: 1º vs 3º
-      const llave2: ManualLlave = { local: top4[1].id, visitante: top4[3].id } // Semifinal 2: 2º vs 4º
+      const llave1: ManualLlave = { local: top4[0].id, visitante: top4[2].id }
+      const llave2: ManualLlave = { local: top4[1].id, visitante: top4[3].id }
 
       await insertarLlaves(llave1, llave2)
-
       setConfirmModal(false)
       await fetchData()
     } catch (error: any) {
@@ -324,7 +349,6 @@ export default function Eliminatorias() {
   // ─── Modal manual: abrir con equipos precargados si existen top4, o vacíos ───
   const abrirModalManual = async () => {
     setGuardandoManual(false)
-    // Si ya hay llaves generadas, precargar con los equipos actuales
     const llave1Actual = partidosEliminatorios.find(p => p.grupo_eliminatorio === 1)
     const llave2Actual = partidosEliminatorios.find(p => p.grupo_eliminatorio === 2)
 
@@ -332,7 +356,6 @@ export default function Eliminatorias() {
       setManualLlave1({ local: llave1Actual.equipo_local_id, visitante: llave1Actual.equipo_visitante_id })
       setManualLlave2({ local: llave2Actual.equipo_local_id, visitante: llave2Actual.equipo_visitante_id })
     } else {
-      // Intentar precargar con el top4 de grupos como sugerencia editable
       try {
         const top4 = await obtenerTop4()
         if (top4.length >= 4) {
@@ -354,7 +377,6 @@ export default function Eliminatorias() {
     if (!torneo) return
 
     const seleccionados = [manualLlave1.local, manualLlave1.visitante, manualLlave2.local, manualLlave2.visitante]
-
     if (seleccionados.some(s => !s)) {
       alert('Completa los 4 equipos de las semifinales.')
       return
@@ -382,30 +404,27 @@ export default function Eliminatorias() {
   const generarFinal = async () => {
     if (!torneo) return
 
-    // Calcular ganador de una llave
     const calcularGanadorLlave = (partidosLlave: Partido[]): string | null => {
       if (partidosLlave.length !== 2) return null
-      // Identificamos ida y vuelta: el partido cuyo local coincide con el "primer equipo" de la llave es la ida
-      const primerEquipo = partidosLlave[0].equipo_local_id   // asumimos que el primer partido insertado es la ida
+      const primerEquipo = partidosLlave[0].equipo_local_id
       const ida = partidosLlave.find(p => p.equipo_local_id === primerEquipo)!
       const vuelta = partidosLlave.find(p => p.equipo_local_id !== primerEquipo)!
       if (!ida || !vuelta ||
           ida.goles_local == null || ida.goles_visitante == null ||
           vuelta.goles_local == null || vuelta.goles_visitante == null) return null
 
-      const equipoA = ida.equipo_local_id       // equipo que juega como local en la ida
+      const equipoA = ida.equipo_local_id
       const equipoB = ida.equipo_visitante_id
       const golesA = (ida.goles_local) + (vuelta.goles_visitante)
       const golesB = (ida.goles_visitante) + (vuelta.goles_local)
 
       if (golesA > golesB) return equipoA
       if (golesB > golesA) return equipoB
-      // empate global → goles de visitante
       const golesVisitanteA = vuelta.goles_visitante
       const golesVisitanteB = ida.goles_visitante
       if (golesVisitanteA > golesVisitanteB) return equipoA
       if (golesVisitanteB > golesVisitanteA) return equipoB
-      return null // empate absoluto (caso raro)
+      return null
     }
 
     try {
@@ -445,15 +464,25 @@ export default function Eliminatorias() {
     }
   }
 
-  // ─── Funciones de edición, reinicio, etc. ───
+  // ─── Editar partido (EXTENDIDO) ───
   const abrirEditar = async (partido: Partido) => {
-    const fecha = partido.fecha ? new Date(partido.fecha).toISOString().slice(0, 10) : ''
     setEditando({
       partidoId: partido.id,
       goles_local: partido.goles_local != null ? String(partido.goles_local) : '',
       goles_visitante: partido.goles_visitante != null ? String(partido.goles_visitante) : '',
-      fecha,
+      fecha: formatDateForInput(partido.fecha, false),
       usarFechaTorneo: false,
+      estado: partido.estado ?? 'pendiente',
+      duracion_segundos: partido.duracion_segundos ?? 0,
+      fase: partido.fase,
+      numero_llave: partido.numero_llave != null ? String(partido.numero_llave) : '',
+      ronda: partido.ronda ?? '',
+      grupo_eliminatorio: partido.grupo_eliminatorio != null ? String(partido.grupo_eliminatorio) : '',
+      inicio_timestamp: formatDateForInput(partido.inicio_timestamp, true),
+      created_at: formatDateForInput(partido.created_at, true),
+      confirmado: partido.confirmado ?? false,
+      equipo_local_id: partido.equipo_local_id,
+      equipo_visitante_id: partido.equipo_visitante_id,
     })
 
     const { data: powerupsData } = await supabase
@@ -461,22 +490,40 @@ export default function Eliminatorias() {
       .select('*')
       .eq('partido_id', partido.id)
     setPowerupsEditando((powerupsData as PowerupUsado[]) || [])
+    setMostrarAvanzado(true);
   }
 
   const guardarPartido = async () => {
     if (!editando) return
     setGuardando(true)
-    const payload: Record<string, unknown> = {}
-    payload.goles_local = editando.goles_local !== '' ? parseInt(editando.goles_local) : null
-    payload.goles_visitante = editando.goles_visitante !== '' ? parseInt(editando.goles_visitante) : null
-    payload.fecha = editando.fecha ? new Date(editando.fecha + 'T12:00:00').toISOString() : null
+
+    const payload: Record<string, unknown> = {
+      goles_local: editando.goles_local !== '' ? parseInt(editando.goles_local) : null,
+      goles_visitante: editando.goles_visitante !== '' ? parseInt(editando.goles_visitante) : null,
+      fecha: parseDateFromInput(editando.fecha, false),
+      estado: editando.estado,
+      duracion_segundos: editando.duracion_segundos,
+      fase: editando.fase,
+      numero_llave: editando.numero_llave !== '' ? parseInt(editando.numero_llave) : null,
+      ronda: editando.ronda || null,
+      grupo_eliminatorio: editando.grupo_eliminatorio !== '' ? parseInt(editando.grupo_eliminatorio) : null,
+      inicio_timestamp: parseDateFromInput(editando.inicio_timestamp, true),
+      created_at: parseDateFromInput(editando.created_at, true),
+      confirmado: editando.confirmado,
+      equipo_local_id: editando.equipo_local_id,
+      equipo_visitante_id: editando.equipo_visitante_id,
+    }
+
+    if (!editando.created_at) delete payload.created_at
+
     await supabase.from('partidos').update(payload).eq('id', editando.partidoId)
     await fetchData()
     setGuardando(false)
     setEditando(null)
+    setMostrarAvanzado(false)
   }
 
-  // --- Power-ups dentro del modal de editar partido ---
+  // --- Power-ups dentro del modal de editar partido (sin cambios) ---
   const usarPowerupEditando = async (equipoId: string, powerupId: string) => {
     if (!editando) return
     const existente = powerupsEditando.find(
@@ -541,6 +588,7 @@ export default function Eliminatorias() {
         goles_visitante: null,
         estado: 'pendiente',
         duracion_segundos: 0,
+        inicio_timestamp: null,   // ← AÑADIR ESTA LÍNEA
       }).eq('id', partido.id)
       if (error) throw error
       setReiniciarModal(null)
@@ -551,7 +599,7 @@ export default function Eliminatorias() {
     }
   }
 
-  // ─── Panel en vivo (completo, igual que PartidosGrupo) ───
+  // ─── Panel en vivo (sin cambios relevantes) ───
   const abrirEnVivo = async (partido: Partido) => {
     setPartidoEnVivo(partido)
     setGolesLocalVivo(partido.goles_local ?? 0)
@@ -609,10 +657,10 @@ export default function Eliminatorias() {
   const reanudarPartido = () => {
     if (!partidoEnVivo) return
     setJugando(true)
-    
+
     const nuevoInicio = new Date(Date.now() - segundos * 1000).toISOString()
     supabase.from('partidos').update({ inicio_timestamp: nuevoInicio }).eq('id', partidoEnVivo.id)
-    
+
     actualizarEstadoVivo('jugando', segundos)
     iniciarTimer(segundos)
   }
@@ -739,15 +787,12 @@ export default function Eliminatorias() {
 
   const hayPartidos = partidosEliminatorios.length > 0
 
-  // Agrupar partidos por llave
   const llave1 = partidosEliminatorios.filter(p => p.grupo_eliminatorio === 1)
   const llave2 = partidosEliminatorios.filter(p => p.grupo_eliminatorio === 2)
   const final = partidosEliminatorios.find(p => p.ronda === 'final')
 
-  // Función para calcular el global de una llave (ya adaptada a que todos los partidos tienen ronda 'semifinal')
   const getGlobal = (partidosLlave: Partido[]): { local: number; visitante: number } | null => {
     if (partidosLlave.length !== 2) return null
-    // La ida es el partido cuyo local es el primer equipo (el cabeza de serie que empezó como local)
     const primerEquipo = partidosLlave[0].equipo_local_id
     const ida = partidosLlave.find(p => p.equipo_local_id === primerEquipo)!
     const vuelta = partidosLlave.find(p => p.equipo_local_id !== primerEquipo)!
@@ -763,7 +808,6 @@ export default function Eliminatorias() {
   const global1 = llave1.length === 2 ? getGlobal(llave1) : null
   const global2 = llave2.length === 2 ? getGlobal(llave2) : null
 
-  // Equipos ya usados en el modal manual (para evitar duplicados en los selects)
   const seleccionadosManual = new Set([
     manualLlave1.local, manualLlave1.visitante, manualLlave2.local, manualLlave2.visitante,
   ].filter(Boolean))
@@ -861,7 +905,6 @@ export default function Eliminatorias() {
         </div>
       ) : (
         <>
-          {/* Bracket visual */}
           <div style={{ display: 'flex', justifyContent: 'center', gap: '20px', flexWrap: 'wrap', marginTop: '10px' }}>
             {/* Llave 1 */}
             <div style={{
@@ -893,7 +936,6 @@ export default function Eliminatorias() {
               )}
             </div>
 
-            {/* Líneas y espacio central */}
             <div style={{
               display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
               width: '80px',
@@ -934,7 +976,6 @@ export default function Eliminatorias() {
             </div>
           </div>
 
-          {/* Final */}
           {final && (
             <div style={{
               display: 'flex', justifyContent: 'center', marginTop: '20px',
@@ -997,7 +1038,7 @@ export default function Eliminatorias() {
         </div>
       )}
 
-      {/* Modal manual de enfrentamientos */}
+      {/* Modal manual de enfrentamientos (sin cambios) */}
       {manualModal && (
         <div style={OVERLAY} onClick={() => setManualModal(false)}>
           <div style={MODAL} onClick={e => e.stopPropagation()}>
@@ -1087,42 +1128,70 @@ export default function Eliminatorias() {
         </div>
       )}
 
+      {/* ─── Modal Editar Partido (COMPLETO) ─── */}
       {editando && (() => {
         const partido = partidosEliminatorios.find(p => p.id === editando.partidoId)
         const local = partido ? equipoById(partido.equipo_local_id) : null
         const visitante = partido ? equipoById(partido.equipo_visitante_id) : null
         return (
-          <div style={OVERLAY} onClick={() => { setEditando(null); setPowerupsEditando([]) }}>
+          <div style={OVERLAY} onClick={() => { setEditando(null); setPowerupsEditando([]); setMostrarAvanzado(false) }}>
             <div style={MODAL} onClick={e => e.stopPropagation()}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <span style={{ fontWeight: '700', fontSize: '16px', color: 'var(--color-textWH)' }}>Editar partido</span>
-                <button onClick={() => { setEditando(null); setPowerupsEditando([]) }} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'rgba(255,255,255,0.4)' }}><X size={16} /></button>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                <span style={{ fontWeight: '700', fontSize: '16px', color: 'var(--color-textWH)' }}>
+                  Editar partido
+                </span>
+                <button onClick={() => { setEditando(null); setPowerupsEditando([]); setMostrarAvanzado(false) }} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'rgba(255,255,255,0.4)' }}>
+                  <X size={16} />
+                </button>
               </div>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '16px' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                  {local?.escudo_url ? <img src={local.escudo_url} style={{ width: 40, height: 40, objectFit: 'contain' }} /> : <div style={{ width: 40, height: 40, borderRadius: 8, background: 'var(--color-border)' }} />}
-                  <span style={{ fontSize: 16, fontWeight: 700, color: 'var(--color-textWH)' }}>{local?.nombre}</span>
-                </div>
-                <span style={{ fontSize: 14, color: 'rgba(255,255,255,0.3)', fontWeight: 600 }}>vs</span>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                  <span style={{ fontSize: 16, fontWeight: 700, color: 'var(--color-textWH)' }}>{visitante?.nombre}</span>
-                  {visitante?.escudo_url ? <img src={visitante.escudo_url} style={{ width: 40, height: 40, objectFit: 'contain' }} /> : <div style={{ width: 40, height: 40, borderRadius: 8, background: 'var(--color-border)' }} />}
-                </div>
+
+              {/* Equipos */}
+              <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
+                <select
+                  value={editando.equipo_local_id}
+                  onChange={e => setEditando(ed => ed ? { ...ed, equipo_local_id: e.target.value } : ed)}
+                  style={{ ...SELECT_STYLE, flex: 1 }}
+                >
+                  {equipos.map(eq => (
+                    <option key={eq.id} value={eq.id}>{eq.nombre}</option>
+                  ))}
+                </select>
+                <span style={{ color: 'rgba(255,255,255,0.3)' }}>vs</span>
+                <select
+                  value={editando.equipo_visitante_id}
+                  onChange={e => setEditando(ed => ed ? { ...ed, equipo_visitante_id: e.target.value } : ed)}
+                  style={{ ...SELECT_STYLE, flex: 1 }}
+                >
+                  {equipos.map(eq => (
+                    <option key={eq.id} value={eq.id}>{eq.nombre}</option>
+                  ))}
+                </select>
               </div>
+
+              {/* Resultado */}
               <div>
                 <p style={LABEL}>Resultado</p>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                  <input style={{ ...INPUT, textAlign: 'center', fontWeight: '700', fontSize: '20px' }} type="number" min={0} placeholder="—" value={editando.goles_local} onChange={e => setEditando(ed => ed ? { ...ed, goles_local: e.target.value } : ed)} />
+                  <input
+                    style={{ ...INPUT, textAlign: 'center', fontWeight: '700', fontSize: '20px' }}
+                    type="number" min={0} placeholder="—"
+                    value={editando.goles_local}
+                    onChange={e => setEditando(ed => ed ? { ...ed, goles_local: e.target.value } : ed)}
+                  />
                   <span style={{ fontSize: '18px', color: 'rgba(255,255,255,0.3)', fontWeight: '700' }}>:</span>
-                  <input style={{ ...INPUT, textAlign: 'center', fontWeight: '700', fontSize: '20px' }} type="number" min={0} placeholder="—" value={editando.goles_visitante} onChange={e => setEditando(ed => ed ? { ...ed, goles_visitante: e.target.value } : ed)} />
+                  <input
+                    style={{ ...INPUT, textAlign: 'center', fontWeight: '700', fontSize: '20px' }}
+                    type="number" min={0} placeholder="—"
+                    value={editando.goles_visitante}
+                    onChange={e => setEditando(ed => ed ? { ...ed, goles_visitante: e.target.value } : ed)}
+                  />
                 </div>
               </div>
+
+              {/* Fecha con texto + calendario */}
               <div>
                 <p style={LABEL}>Fecha</p>
-                <label style={{
-                  display: 'flex', alignItems: 'center', gap: '8px',
-                  marginBottom: '8px', cursor: 'pointer', userSelect: 'none',
-                }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px', cursor: 'pointer' }}>
                   <input
                     type="checkbox"
                     checked={editando.usarFechaTorneo}
@@ -1131,31 +1200,90 @@ export default function Eliminatorias() {
                       setEditando(ed => {
                         if (!ed) return ed
                         if (marcado && torneo?.created_at) {
-                          return {
-                            ...ed,
-                            usarFechaTorneo: true,
-                            fecha: new Date(torneo.created_at).toISOString().slice(0, 10),
-                          }
+                          return { ...ed, usarFechaTorneo: true, fecha: formatDateForInput(torneo.created_at, false) }
                         }
                         return { ...ed, usarFechaTorneo: marcado }
                       })
                     }}
-                    style={{ width: '16px', height: '16px', cursor: 'pointer', accentColor: 'var(--color-accent)' }}
+                    style={{ width: '16px', height: '16px', accentColor: 'var(--color-accent)' }}
                   />
-                  <span style={{ fontSize: '13px', color: 'rgba(255,255,255,0.7)' }}>
-                    Usar fecha del torneo
-                  </span>
+                  <span style={{ fontSize: '13px', color: 'rgba(255,255,255,0.7)' }}>Usar fecha del torneo</span>
                 </label>
+                <div style={{ display: 'flex', gap: '8px' }}>
+                  <input
+                    style={{ ...INPUT, opacity: editando.usarFechaTorneo ? 0.6 : 1, flex: 1 }}
+                    type="text"
+                    placeholder="YYYY-MM-DD"
+                    disabled={editando.usarFechaTorneo}
+                    value={editando.fecha}
+                    onChange={e => setEditando(ed => ed ? { ...ed, fecha: e.target.value } : ed)}
+                  />
+                  <button
+                    type="button"
+                    disabled={editando.usarFechaTorneo}
+                    onClick={() => (document.getElementById('hidden-elim-fecha') as HTMLInputElement)?.showPicker()}
+                    style={{
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      width: '40px', height: '40px', borderRadius: '10px',
+                      background: 'var(--color-border)', border: '1px solid var(--color-border)',
+                      color: 'var(--color-textWH)', cursor: editando.usarFechaTorneo ? 'not-allowed' : 'pointer',
+                      opacity: editando.usarFechaTorneo ? 0.6 : 1,
+                    }}
+                  >
+                    <Calendar size={18} />
+                  </button>
+                </div>
                 <input
-                  style={{ ...INPUT, opacity: editando.usarFechaTorneo ? 0.6 : 1 }}
+                  id="hidden-elim-fecha"
                   type="date"
-                  disabled={editando.usarFechaTorneo}
-                  value={editando.fecha}
-                  onChange={e => setEditando(ed => ed ? { ...ed, fecha: e.target.value } : ed)}
+                  style={{ position: 'absolute', opacity: 0, pointerEvents: 'none', width: 0, height: 0 }}
+                  onChange={e => {
+                    if (!e.target.value) return
+                    setEditando(ed => ed ? { ...ed, fecha: e.target.value } : ed)
+                  }}
                 />
               </div>
 
-              {/* Power-ups del partido */}
+              {/* Estado y duración */}
+              <div style={{ display: 'flex', gap: '10px' }}>
+                <div style={{ flex: 1 }}>
+                  <p style={LABEL}>Estado</p>
+                  <select
+                    value={editando.estado}
+                    onChange={e => setEditando(ed => ed ? { ...ed, estado: e.target.value } : ed)}
+                    style={SELECT_STYLE}
+                  >
+                    <option value="pendiente">Pendiente</option>
+                    <option value="jugando">Jugando</option>
+                    <option value="pausado">Pausado</option>
+                    <option value="finalizado">Finalizado</option>
+                  </select>
+                </div>
+                <div style={{ flex: 1 }}>
+                  <p style={LABEL}>Duración (seg)</p>
+                  <input
+                    style={INPUT}
+                    type="number" min={0}
+                    value={editando.duracion_segundos}
+                    onChange={e => setEditando(ed => ed ? { ...ed, duracion_segundos: parseInt(e.target.value) || 0 } : ed)}
+                  />
+                </div>
+              </div>
+
+              {/* Confirmado */}
+              <div>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '12px', cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={editando.confirmado}
+                    onChange={e => setEditando(ed => ed ? { ...ed, confirmado: e.target.checked } : ed)}
+                    style={{ width: '18px', height: '18px', accentColor: 'var(--color-accent)' }}
+                  />
+                  <span style={{ ...LABEL, marginBottom: 0 }}>Confirmado</span>
+                </label>
+              </div>
+
+              {/* Power-ups (sin cambios) */}
               <div>
                 <p style={LABEL}>Power-ups</p>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
@@ -1195,30 +1323,18 @@ export default function Eliminatorias() {
                             }}>
                               <img src={POWERUP_IMAGES[cat.nombre] ?? ''} alt={cat.nombre} style={{ width: 18, height: 18, objectFit: 'contain' }} />
                               <span style={{ fontSize: '12px', color: 'var(--color-textWH)', fontWeight: 600 }}>{cat.nombre} x{pu.cantidad}</span>
-                              <button
-                                onClick={() => restarPowerupEditando(pu)}
-                                title="Quitar uno"
-                                style={{
-                                  width: '20px', height: '20px', borderRadius: '5px',
-                                  background: 'rgba(255,200,0,0.15)', border: 'none',
-                                  color: '#FFC800', fontSize: '13px', fontWeight: '700',
-                                  cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
-                                }}
-                              >
-                                −
-                              </button>
-                              <button
-                                onClick={() => eliminarPowerupEditando(pu)}
-                                title="Eliminar power-up"
-                                style={{
-                                  width: '20px', height: '20px', borderRadius: '5px',
-                                  background: 'rgba(220,50,50,0.15)', border: 'none',
-                                  color: 'var(--color-error)', cursor: 'pointer',
-                                  display: 'flex', alignItems: 'center', justifyContent: 'center',
-                                }}
-                              >
-                                <X size={12} />
-                              </button>
+                              <button onClick={() => restarPowerupEditando(pu)} title="Quitar uno" style={{
+                                width: '20px', height: '20px', borderRadius: '5px',
+                                background: 'rgba(255,200,0,0.15)', border: 'none',
+                                color: '#FFC800', fontSize: '13px', fontWeight: '700',
+                                cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                              }}>−</button>
+                              <button onClick={() => eliminarPowerupEditando(pu)} title="Eliminar power-up" style={{
+                                width: '20px', height: '20px', borderRadius: '5px',
+                                background: 'rgba(220,50,50,0.15)', border: 'none',
+                                color: 'var(--color-error)', cursor: 'pointer',
+                                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                              }}><X size={12} /></button>
                             </div>
                           )
                         })}
@@ -1260,30 +1376,18 @@ export default function Eliminatorias() {
                             }}>
                               <img src={POWERUP_IMAGES[cat.nombre] ?? ''} alt={cat.nombre} style={{ width: 18, height: 18, objectFit: 'contain' }} />
                               <span style={{ fontSize: '12px', color: 'var(--color-textWH)', fontWeight: 600 }}>{cat.nombre} x{pu.cantidad}</span>
-                              <button
-                                onClick={() => restarPowerupEditando(pu)}
-                                title="Quitar uno"
-                                style={{
-                                  width: '20px', height: '20px', borderRadius: '5px',
-                                  background: 'rgba(255,200,0,0.15)', border: 'none',
-                                  color: '#FFC800', fontSize: '13px', fontWeight: '700',
-                                  cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
-                                }}
-                              >
-                                −
-                              </button>
-                              <button
-                                onClick={() => eliminarPowerupEditando(pu)}
-                                title="Eliminar power-up"
-                                style={{
-                                  width: '20px', height: '20px', borderRadius: '5px',
-                                  background: 'rgba(220,50,50,0.15)', border: 'none',
-                                  color: 'var(--color-error)', cursor: 'pointer',
-                                  display: 'flex', alignItems: 'center', justifyContent: 'center',
-                                }}
-                              >
-                                <X size={12} />
-                              </button>
+                              <button onClick={() => restarPowerupEditando(pu)} title="Quitar uno" style={{
+                                width: '20px', height: '20px', borderRadius: '5px',
+                                background: 'rgba(255,200,0,0.15)', border: 'none',
+                                color: '#FFC800', fontSize: '13px', fontWeight: '700',
+                                cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                              }}>−</button>
+                              <button onClick={() => eliminarPowerupEditando(pu)} title="Eliminar power-up" style={{
+                                width: '20px', height: '20px', borderRadius: '5px',
+                                background: 'rgba(220,50,50,0.15)', border: 'none',
+                                color: 'var(--color-error)', cursor: 'pointer',
+                                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                              }}><X size={12} /></button>
                             </div>
                           )
                         })}
@@ -1291,6 +1395,145 @@ export default function Eliminatorias() {
                   </div>
                 </div>
               </div>
+
+              {/* Sección Avanzada */}
+              <div>
+                <button
+                  onClick={() => setMostrarAvanzado(!mostrarAvanzado)}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: '8px',
+                    background: 'none', border: 'none', color: 'rgba(255,255,255,0.5)',
+                    fontWeight: '600', fontSize: '13px', cursor: 'pointer', padding: 0,
+                  }}
+                >
+                  <ChevronDown
+                    size={14}
+                    style={{
+                      transform: mostrarAvanzado ? 'rotate(180deg)' : 'none',
+                      transition: 'transform 0.2s',
+                    }}
+                  />
+                  Avanzado
+                </button>
+                {mostrarAvanzado && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '14px', marginTop: '12px' }}>
+                    {/* Fase */}
+                    <div>
+                      <p style={LABEL}>Fase</p>
+                      <input
+                        style={INPUT}
+                        type="text"
+                        value={editando.fase}
+                        onChange={e => setEditando(ed => ed ? { ...ed, fase: e.target.value } : ed)}
+                      />
+                    </div>
+
+                    {/* Numero llave, Ronda, Grupo eliminatorio */}
+                    <div style={{ display: 'flex', gap: '10px' }}>
+                      <div style={{ flex: 1 }}>
+                        <p style={LABEL}>Nº Llave</p>
+                        <input
+                          style={INPUT}
+                          type="number"
+                          value={editando.numero_llave}
+                          onChange={e => setEditando(ed => ed ? { ...ed, numero_llave: e.target.value } : ed)}
+                        />
+                      </div>
+                      <div style={{ flex: 1 }}>
+                        <p style={LABEL}>Ronda</p>
+                        <input
+                          style={INPUT}
+                          type="text"
+                          value={editando.ronda}
+                          onChange={e => setEditando(ed => ed ? { ...ed, ronda: e.target.value } : ed)}
+                        />
+                      </div>
+                      <div style={{ flex: 1 }}>
+                        <p style={LABEL}>Grupo Elim.</p>
+                        <input
+                          style={INPUT}
+                          type="number"
+                          value={editando.grupo_eliminatorio}
+                          onChange={e => setEditando(ed => ed ? { ...ed, grupo_eliminatorio: e.target.value } : ed)}
+                        />
+                      </div>
+                    </div>
+
+                    {/* inicio_timestamp */}
+                    <div>
+                      <p style={LABEL}>Inicio (timestamp)</p>
+                      <div style={{ display: 'flex', gap: '8px' }}>
+                        <input
+                          style={{ ...INPUT, flex: 1 }}
+                          type="text"
+                          placeholder="YYYY-MM-DD HH:mm:ss"
+                          value={editando.inicio_timestamp}
+                          onChange={e => setEditando(ed => ed ? { ...ed, inicio_timestamp: e.target.value } : ed)}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => (document.getElementById('hidden-elim-inicio') as HTMLInputElement)?.showPicker()}
+                          style={{
+                            width: '40px', height: '40px', borderRadius: '10px',
+                            background: 'var(--color-border)', border: '1px solid var(--color-border)',
+                            color: 'var(--color-textWH)', cursor: 'pointer',
+                            display: 'flex', alignItems: 'center', justifyContent: 'center',
+                          }}
+                        >
+                          <Calendar size={18} />
+                        </button>
+                      </div>
+                      <input
+                        id="hidden-elim-inicio"
+                        type="datetime-local"
+                        style={{ position: 'absolute', opacity: 0, pointerEvents: 'none', width: 0, height: 0 }}
+                        onChange={e => {
+                          if (!e.target.value) return
+                          const formatted = e.target.value.replace('T', ' ') + ':00'
+                          setEditando(ed => ed ? { ...ed, inicio_timestamp: formatted } : ed)
+                        }}
+                      />
+                    </div>
+
+                    {/* created_at */}
+                    <div>
+                      <p style={LABEL}>Creado (timestamp)</p>
+                      <div style={{ display: 'flex', gap: '8px' }}>
+                        <input
+                          style={{ ...INPUT, flex: 1 }}
+                          type="text"
+                          placeholder="YYYY-MM-DD HH:mm:ss"
+                          value={editando.created_at}
+                          onChange={e => setEditando(ed => ed ? { ...ed, created_at: e.target.value } : ed)}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => (document.getElementById('hidden-elim-created') as HTMLInputElement)?.showPicker()}
+                          style={{
+                            width: '40px', height: '40px', borderRadius: '10px',
+                            background: 'var(--color-border)', border: '1px solid var(--color-border)',
+                            color: 'var(--color-textWH)', cursor: 'pointer',
+                            display: 'flex', alignItems: 'center', justifyContent: 'center',
+                          }}
+                        >
+                          <Calendar size={18} />
+                        </button>
+                      </div>
+                      <input
+                        id="hidden-elim-created"
+                        type="datetime-local"
+                        style={{ position: 'absolute', opacity: 0, pointerEvents: 'none', width: 0, height: 0 }}
+                        onChange={e => {
+                          if (!e.target.value) return
+                          const formatted = e.target.value.replace('T', ' ') + ':00'
+                          setEditando(ed => ed ? { ...ed, created_at: formatted } : ed)
+                        }}
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+
               <button onClick={guardarPartido} disabled={guardando} style={{
                 display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px',
                 padding: '12px', borderRadius: '11px', background: 'var(--color-accent)',
@@ -1304,7 +1547,7 @@ export default function Eliminatorias() {
         )
       })()}
 
-      {/* Modal seleccionar power-up a agregar (dentro de editar partido) */}
+      {/* Modal seleccionar power-up a agregar (sin cambios) */}
       {modalPowerupEditar && (
         <div style={{ ...OVERLAY, zIndex: 1100 }} onClick={() => setModalPowerupEditar(null)}>
           <div style={{ ...MODAL, maxWidth: '500px' }} onClick={e => e.stopPropagation()}>
@@ -1366,7 +1609,7 @@ export default function Eliminatorias() {
         </div>
       )}
 
-      {/* ─── Panel en vivo ─── */}
+      {/* ─── Panel en vivo (sin cambios) ─── */}
       {partidoEnVivo && (() => {
         const local = equipoById(partidoEnVivo.equipo_local_id)
         const visitante = equipoById(partidoEnVivo.equipo_visitante_id)
@@ -1462,7 +1705,7 @@ export default function Eliminatorias() {
         )
       })()}
 
-      {/* Modal power‑up */}
+      {/* Modal power‑up (sin cambios) */}
       {modalPowerup && (
         <div style={OVERLAY} onClick={() => setModalPowerup(null)}>
           <div style={{ ...MODAL, maxWidth: 500 }} onClick={e => e.stopPropagation()}>
@@ -1482,7 +1725,7 @@ export default function Eliminatorias() {
         </div>
       )}
 
-      {/* Modal campo de gol */}
+      {/* Modal campo de gol (sin cambios) */}
       {showFieldModal && pendingGoal && (() => {
         const teamColor = equipos.find(e => e.id === pendingGoal.equipoId)?.color_hex || '#FF0000'
         const darker = darkenHex(teamColor, 0.7)

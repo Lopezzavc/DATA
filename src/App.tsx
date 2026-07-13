@@ -6,15 +6,16 @@ import ProtectedRoute from './components/ProtectedRoute'
 import Torneos from './pages/admin/Torneos'
 import Equipos from './pages/admin/Equipos'
 import Partidos from './pages/admin/Partidos'
-import Estadisticas from './pages/admin/Estadisticas'
 import PartidosGrupo from './pages/admin/PartidosGrupo'
 import ClasificatoriaGrupos from './pages/admin/ClasificatoriaGrupos'
 import Eliminatorias from './pages/admin/Eliminatorias'
+import Estadisticas from './pages/Estadisticas'
 
 function App() {
   return (
     <Routes>
       <Route path="/" element={<Public />} />
+      <Route path="/estadisticas" element={<Estadisticas />} />
       <Route path="/admin/login" element={<Login />} />
       <Route
         path="/admin"

@@ -1,10 +1,11 @@
 // src/pages/Public.tsx
 import { useEffect, useState, useCallback, useMemo } from 'react'
 import {
-  ChevronDown, Trophy, Loader2, Zap, History, Calendar, Radio, Check, X as XIcon, User
+  ChevronDown, Trophy, Loader2, Zap, History, Calendar, Radio, User, BarChart3, TrendingUp, TrendingDown, Minus
 } from 'lucide-react'
 import { supabase } from '../lib/supabase'
 import { useTorneoActivo, type Torneo } from '../hooks/useTorneoActivo'
+import { useNavigate } from 'react-router-dom'
 import canchaImage from '../assets/cancha.png'
 import beachBall from '../assets/powerups/beach-ball.png'
 import moveBall from '../assets/powerups/move-ball.png'
@@ -17,6 +18,7 @@ import block from '../assets/powerups/block.png'
 import bigHead from '../assets/powerups/big-head.png'
 import ghosted from '../assets/powerups/ghosted.png'
 import movePlayer from '../assets/powerups/move-player.png'
+import { calcularEloHistorico, type PartidoParaElo, type EloEntry } from '../lib/elo'
 
 // ─── Interfaces ───
 interface Equipo {
@@ -43,6 +45,7 @@ interface Partido {
   torneo_id?: string
   fase?: string
   inicio_timestamp?: string | null
+  confirmado: boolean
 }
 
 interface Jornada {
@@ -77,21 +80,15 @@ interface MatchDetail {
   powerups: { [equipoId: string]: PowerupInfo[] }
 }
 
-// ─── Racha y forma reciente de un equipo (feature 1) ───
-interface RachaYForma {
-  rachaMaxima: number // mayor racha histórica sin perder (victorias + empates consecutivos)
-  ultimos5: ('V' | 'E' | 'D')[] // más reciente al final
-}
-
 // ─── Progresión de goles por intervalos de minutos (feature 4) ───
 // Intervalos en minutos: (1,15) (16,30) (31,45) (46,60) (61,75) (75>)
 const INTERVALOS_GOLES: { desde: number; hasta: number; label: string }[] = [
-  { desde: 0, hasta: 400, label: '0:00-6:40' },
-  { desde: 400, hasta: 800, label: '6:40-13:20' },
-  { desde: 800, hasta: 1200, label: '13:20-20:00' },
-  { desde: 1200, hasta: 1600, label: '20:00-26:40' },
-  { desde: 1600, hasta: 2000, label: '26:40-33:20' },
-  { desde: 2000, hasta: Infinity, label: '33:20-40:00+' },
+  { desde: 0, hasta: 400, label: '(0:00 - 6:40)'},
+  { desde: 400, hasta: 800, label: '(6:40 - 13:20)'},
+  { desde: 800, hasta: 1200, label: '(13:20 - 20:00)'},
+  { desde: 1200, hasta: 1600, label: '(20:00 - 26:40)'},
+  { desde: 1600, hasta: 2000, label: '(26:40 - 33:20)'},
+  { desde: 2000, hasta: Infinity, label: '(33:20 - 40:00+)'},
 ]
 const INTERVALO_COLORES = ['#FF2D6B', '#FFA135', '#F4E018', '#2FE07A', '#2FB6E0', '#B5266E']
 
@@ -188,35 +185,6 @@ function colorPorPorcentaje(pct: number): string {
 // Genera una clave única y estable para un par de equipos, sin importar el orden
 function h2hKey(equipoAId: string, equipoBId: string) {
   return [equipoAId, equipoBId].sort().join('__')
-}
-
-// ─── Cálculo de racha máxima (sin derrota: victorias + empates cuentan) y forma
-// de los últimos 5 partidos, a partir del historial completo de un equipo (orden
-// cronológico ascendente esperado). ───
-function calcularRachaYForma(partidosOrdenadosAsc: { golesA: number | null; golesB: number | null }[]): RachaYForma {
-  let rachaMaxima = 0
-  let rachaActual = 0
-  const resultados: ('V' | 'E' | 'D')[] = []
-
-  partidosOrdenadosAsc.forEach(p => {
-    if (p.golesA == null || p.golesB == null) return
-    let resultado: 'V' | 'E' | 'D'
-    if (p.golesA > p.golesB) resultado = 'V'
-    else if (p.golesA < p.golesB) resultado = 'D'
-    else resultado = 'E'
-
-    resultados.push(resultado)
-
-    if (resultado === 'D') {
-      rachaActual = 0
-    } else {
-      rachaActual++
-      if (rachaActual > rachaMaxima) rachaMaxima = rachaActual
-    }
-  })
-
-  const ultimos5 = resultados.slice(-5)
-  return { rachaMaxima, ultimos5 }
 }
 
 // ─── Cálculo de progresión de goles por intervalos de minutos, a partir de la
@@ -350,6 +318,7 @@ function calcularProbabilidades(params: {
 // ─── Componente principal ───
 export default function Public() {
   const { torneos, torneoActivo, setTorneoActivo } = useTorneoActivo()
+  const navigate = useNavigate()
   const [equipos, setEquipos] = useState<Equipo[]>([])
   const [jornadas, setJornadas] = useState<Jornada[]>([])
   const [partidosGrupos, setPartidosGrupos] = useState<Partido[]>([])
@@ -369,11 +338,6 @@ export default function Public() {
   // inicial de fuerza de cada equipo. Se cachea por equipo_id. ───
   const [recordGeneralCache, setRecordGeneralCache] = useState<Record<string, { victorias: number; empates: number; derrotas: number }>>({})
   const [recordGeneralCargado, setRecordGeneralCargado] = useState<Record<string, boolean>>({})
-
-  // ─── Racha máxima histórica sin perder + forma de los últimos 5 partidos,
-  // por equipo (feature 1). Se cachea por equipo_id. ───
-  const [rachaFormaCache, setRachaFormaCache] = useState<Record<string, RachaYForma>>({})
-  const [rachaFormaCargado, setRachaFormaCargado] = useState<Record<string, boolean>>({})
 
   // ─── Progresión histórica de goles por intervalos de minutos, por equipo
   // (feature 4). Se cachea por equipo_id. ───
@@ -399,6 +363,18 @@ export default function Public() {
   // Reloj en vivo (tick local, sincronizado con duracion_segundos + estado del partido)
   const [tickEnVivo, setTickEnVivo] = useState(0)
 
+  // ─── Sistema de clasificación ELO persistente e histórico ───
+  // Se calcula UNA sola vez a partir de TODOS los partidos confirmados de
+  // TODAS las ediciones del torneo, ordenados cronológicamente por
+  // inicio_timestamp. Es completamente independiente del torneo activo/filtro
+  // actual: un equipo conserva su ELO acumulado entre ediciones y el cálculo
+  // nunca debe hacerse con información aislada de una sola edición.
+  const [partidosParaElo, setPartidosParaElo] = useState<PartidoParaElo[]>([])
+  const [loadingElo, setLoadingElo] = useState(false)
+
+  const resultadoElo = useMemo(() => calcularEloHistorico(partidosParaElo), [partidosParaElo])
+  const eloHistorialPorPartidoId: Record<string, EloEntry> = resultadoElo.historialPorPartidoId
+
   useEffect(() => {
     if (!torneos || torneos.length === 0) return
     const map: Record<string, { edicion: string | null; nombre: string | null; numero: number }> = {}
@@ -416,12 +392,12 @@ export default function Public() {
     return t.edicion || `Torneo ${t.numero}`
   }, [torneosMap])
 
-  // Devuelve la letra + color que representa la fase/ronda de un partido:
-  // "G" grupos (gris), "E" eliminatoria (rojo), "F" final (amarillo)
-  const faseInfo = useCallback((partido: Partido): { letra: string; color: string } | null => {
-    if (partido.ronda === 'final') return { letra: 'F', color: '#FFC800' }
-    if (partido.fase === 'eliminatorias') return { letra: 'E', color: '#FF4D4D' }
-    if (partido.fase === 'grupos') return { letra: 'G', color: 'rgba(255,255,255,0.5)' }
+  // Devuelve la letra + nombre completo + color que representa la fase/ronda de
+  // un partido: "G" Grupos (gris), "E" Eliminatorias (rojo), "F" Final (amarillo)
+  const faseInfo = useCallback((partido: Partido): { letra: string; nombre: string; color: string } | null => {
+    if (partido.ronda === 'final') return { letra: 'F', nombre: 'Final', color: '#FFC800' }
+    if (partido.fase === 'eliminatorias') return { letra: 'E', nombre: 'Eliminatorias', color: '#FF4D4D' }
+    if (partido.fase === 'grupos') return { letra: 'G', nombre: 'Grupos', color: 'rgba(255,255,255,0.5)' }
     return null
   }, [])
 
@@ -430,6 +406,39 @@ export default function Public() {
     const etiqueta = torneoActivo?.edicion || (torneoActivo ? `Torneo ${torneoActivo.numero}` : '')
     document.title = `Copa DISCORD${etiqueta ? ` - ${etiqueta}` : ''}`
   }, [torneoActivo])
+
+  // ─── Carga de TODOS los partidos confirmados de TODAS las ediciones, para
+  // alimentar el cálculo del ELO histórico. Se ejecuta una sola vez, es
+  // independiente del torneo activo, y nunca se recalcula con información
+  // aislada de una sola edición. ───
+  useEffect(() => {
+    const cargarPartidosParaElo = async () => {
+      setLoadingElo(true)
+      try {
+        let desde = 0
+        const tamanoPagina = 1000
+        let todos: PartidoParaElo[] = []
+        while (true) {
+          const { data: pagina } = await supabase
+            .from('partidos')
+            .select('id, equipo_local_id, equipo_visitante_id, goles_local, goles_visitante, fase, ronda, inicio_timestamp, confirmado')
+            .eq('confirmado', true)
+            .order('id', { ascending: true })
+            .range(desde, desde + tamanoPagina - 1)
+          if (!pagina || pagina.length === 0) break
+          todos = todos.concat(pagina as PartidoParaElo[])
+          if (pagina.length < tamanoPagina) break
+          desde += tamanoPagina
+        }
+        setPartidosParaElo(todos)
+      } catch (error) {
+        console.error('Error cargando partidos para el cálculo de ELO:', error)
+      } finally {
+        setLoadingElo(false)
+      }
+    }
+    cargarPartidosParaElo()
+  }, [])
 
   const cargarDatos = useCallback(async (torneo: Torneo, isRealtimeUpdate = false) => {
     if (!isRealtimeUpdate) {
@@ -495,9 +504,9 @@ export default function Public() {
       // ─── Power-ups: se calculan sobre TODOS los partidos de fase de grupos
       // (jugados o no) para que el total coincida siempre con ClasificatoriaGrupos.tsx,
       // que toma como base todos los partidos de la fase de grupos del torneo. ───
-      const { data: partidosGrupoTodos } = await supabase
-        .from('partidos').select('id').eq('torneo_id', torneo.id).eq('fase', 'grupos')
-      const partidosGrupoIds = (partidosGrupoTodos || []).map(p => p.id)
+      const { data: partidosTorneo } = await supabase
+        .from('partidos').select('id').eq('torneo_id', torneo.id)
+      const partidosTorneoIds = (partidosTorneo || []).map(p => p.id)
 
       if (partidosIds.length > 0) {
         const { data: golesData } = await supabase
@@ -526,9 +535,14 @@ export default function Public() {
           powerups: powerupsByMatch[p.id] || {},
         }))
         matchesConPowerups.sort((a, b) => {
-          const da = a.partido.created_at ? new Date(a.partido.created_at).getTime() : 0
-          const db = b.partido.created_at ? new Date(b.partido.created_at).getTime() : 0
-          return db - da
+          // Priorizar inicio_timestamp (fecha y hora real del partido)
+          const ta = a.partido.inicio_timestamp
+            ? new Date(a.partido.inicio_timestamp).getTime()
+            : (a.partido.created_at ? new Date(a.partido.created_at).getTime() : 0)
+          const tb = b.partido.inicio_timestamp
+            ? new Date(b.partido.inicio_timestamp).getTime()
+            : (b.partido.created_at ? new Date(b.partido.created_at).getTime() : 0)
+          return tb - ta   // descendente: el más reciente primero
         })
         setTeamMatches(matchesConPowerups)
       } else {
@@ -540,10 +554,10 @@ export default function Public() {
       // igual que en ClasificatoriaGrupos.tsx: se basa en TODOS los partidos de
       // fase de grupos del torneo, no solo los ya finalizados). ───
       if (equiposList.length > 0) {
-        if (partidosGrupoIds.length > 0) {
+        if (partidosTorneoIds.length > 0) {
           const { data: puUsadosGrupo } = await supabase
             .from('powerups_usados').select('equipo_id, powerup_id, cantidad')
-            .in('partido_id', partidosGrupoIds)
+            .in('partido_id', partidosTorneoIds)
           const { data: catalogoGrupo } = await supabase.from('powerups_catalogo').select('id, nombre')
 
           const equipoPowerMap: Record<string, Record<string, number>> = {}
@@ -746,7 +760,8 @@ export default function Public() {
 
   // ─── Cargar historial head-to-head entre los dos equipos del partido expandido.
   // Se busca en TODOS los torneos (incluido el activo) y en ambas fases
-  // (grupos + eliminatorias), sin importar quién fue local o visitante. ───
+  // (grupos + eliminatorias), sin importar quién fue local o visitante. El
+  // orden es único y exclusivamente por inicio_timestamp descendente. ───
   useEffect(() => {
     if (!expandedMatchId) return
     const detalle = teamMatches.find(m => m.partido.id === expandedMatchId)
@@ -779,23 +794,11 @@ export default function Public() {
           .not('goles_visitante', 'is', null)
 
         const todos = [...(comoLocal || []), ...(comoVisitante || [])] as Partido[]
+        // ─── Orden único y exclusivo: inicio_timestamp descendente (más reciente primero) ───
         todos.sort((a, b) => {
-          const numA = torneosMap[a.torneo_id!]?.numero ?? 0
-          const numB = torneosMap[b.torneo_id!]?.numero ?? 0
-          if (numA !== numB) return numB - numA
-
-          const ordenFase = (p: Partido) => {
-            if (p.ronda === 'final') return 2
-            if (p.fase === 'eliminatorias') return 1
-            return 0
-          }
-          const faseA = ordenFase(a)
-          const faseB = ordenFase(b)
-          if (faseA !== faseB) return faseB - faseA
-
-          const da = a.fecha ? new Date(a.fecha).getTime() : (a.created_at ? new Date(a.created_at).getTime() : 0)
-          const db = b.fecha ? new Date(b.fecha).getTime() : (b.created_at ? new Date(b.created_at).getTime() : 0)
-          return db - da
+          const ta = a.inicio_timestamp ? new Date(a.inicio_timestamp).getTime() : 0
+          const tb = b.inicio_timestamp ? new Date(b.inicio_timestamp).getTime() : 0
+          return tb - ta
         })
 
         if (!cancelado) {
@@ -862,23 +865,6 @@ export default function Public() {
               if (!cancelado) {
                 setRecordGeneralCache(prev => (prev[equipoId] ? prev : { ...prev, [equipoId]: { victorias, empates, derrotas } }))
                 setRecordGeneralCargado(prev => (prev[equipoId] ? prev : { ...prev, [equipoId]: true }))
-              }
-
-              // ─── Racha máxima sin perder + forma últimos 5 (a partir de los
-              // mismos partidos, ordenados cronológicamente ascendente) ───
-              const todosOrdenCron = [
-                ...(comoLocalGen || []).map(p => ({ ...p, golesA: p.goles_local, golesB: p.goles_visitante })),
-                ...(comoVisitanteGen || []).map(p => ({ ...p, golesA: p.goles_visitante, golesB: p.goles_local })),
-              ].filter(p => p.id !== partido.id)
-              todosOrdenCron.sort((a, b) => {
-                const da = a.fecha ? new Date(a.fecha).getTime() : (a.created_at ? new Date(a.created_at).getTime() : 0)
-                const db = b.fecha ? new Date(b.fecha).getTime() : (b.created_at ? new Date(b.created_at).getTime() : 0)
-                return da - db
-              })
-              const rachaForma = calcularRachaYForma(todosOrdenCron.map(p => ({ golesA: p.golesA, golesB: p.golesB })))
-              if (!cancelado) {
-                setRachaFormaCache(prev => (prev[equipoId] ? prev : { ...prev, [equipoId]: rachaForma }))
-                setRachaFormaCargado(prev => (prev[equipoId] ? prev : { ...prev, [equipoId]: true }))
               }
             } catch (error) {
               console.error('Error cargando récord/racha general del equipo:', error)
@@ -1279,6 +1265,21 @@ export default function Public() {
               </span>
             )}
           </h1>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+            <button
+              onClick={() => navigate('/estadisticas')}
+              className="dropdown-btn"
+              style={{
+                display: 'flex', alignItems: 'center', gap: '8px',
+                padding: '12px 18px', borderRadius: '12px',
+                background: 'var(--color-background)', border: '2px solid var(--color-border)',
+                color: 'var(--color-textWH)', fontSize: '15px', fontWeight: '600',
+                cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0,
+              }}
+            >
+              <BarChart3 size={18} color="var(--color-accent)" />
+              Ver estadísticas
+            </button>
           <div className="torneo-dropdown-wrapper" style={{ position: 'relative', width: '320px' }}>
             <button
               onClick={() => setDropdownOpen(!dropdownOpen)}
@@ -1328,11 +1329,6 @@ export default function Public() {
                     {ESTADO_LABELS[torneoActivo.estado]}
                   </span>
                 )}
-                {torneoActivo?.activo && (
-                  <span style={{ padding: '2px 8px', borderRadius: '20px', background: 'rgba(0,200,140,0.15)', border: '1px solid rgba(0,200,140,0.3)', color: 'var(--color-accent)', fontSize: '11px', fontWeight: '700', whiteSpace: 'nowrap' }}>
-                    EN JUEGO
-                  </span>
-                )}
               </div>
               <ChevronDown size={18} color="rgba(255,255,255,0.5)" style={{ transform: dropdownOpen ? 'rotate(180deg)' : 'none', transition: 'transform 0.2s' }} />
             </button>
@@ -1372,16 +1368,12 @@ export default function Public() {
                       }}>
                         {ESTADO_LABELS[t.estado]}
                       </span>
-                      {t.activo && (
-                        <span style={{ padding: '2px 8px', borderRadius: '20px', background: 'rgba(0,200,140,0.15)', border: '1px solid rgba(0,200,140,0.3)', color: 'var(--color-accent)', fontSize: '10px', fontWeight: '700' }}>
-                          EN JUEGO
-                        </span>
-                      )}
                     </button>
                   )
                 })}
               </div>
             )}
+          </div>  
           </div>
         </div>
 
@@ -1433,84 +1425,10 @@ export default function Public() {
 
                   const pausado = partido.estado === 'pausado'
 
-                  // ─── Feature 1: racha máxima + forma reciente ───
-                  const rachaLocal = rachaFormaCache[partido.equipo_local_id]
-                  const rachaVisitante = rachaFormaCache[partido.equipo_visitante_id]
-                  const rachaListas = !!rachaFormaCargado[partido.equipo_local_id] && !!rachaFormaCargado[partido.equipo_visitante_id]
-
                   // ─── Feature 4: progresión de goles por intervalos ───
                   const progresionLocal = progresionGolesCache[partido.equipo_local_id]
                   const progresionVisitante = progresionGolesCache[partido.equipo_visitante_id]
                   const progresionLista = !!progresionGolesCargado[partido.equipo_local_id] && !!progresionGolesCargado[partido.equipo_visitante_id]
-
-                  const FormaDot = ({ resultado }: { resultado: 'V' | 'E' | 'D' }) => {
-                    const cfg = {
-                      V: { bg: 'rgba(0,200,140,0.16)', border: 'rgba(0,200,140,0.55)', color: 'rgb(0,200,140)' },
-                      D: { bg: 'rgba(255,77,77,0.16)', border: 'rgba(255,77,77,0.55)', color: 'rgb(255,77,77)' },
-                      E: { bg: 'rgba(255,255,255,0.08)', border: 'rgba(255,255,255,0.28)', color: 'rgba(255,255,255,0.65)' },
-                    }[resultado]
-                    return (
-                      <span style={{
-                        width: 22, height: 22, borderRadius: '50%', flexShrink: 0,
-                        display: 'flex', alignItems: 'center', justifyContent: 'center',
-                        background: cfg.bg, border: `1.5px solid ${cfg.border}`,
-                      }}>
-                        {resultado === 'V' && <Check size={12} color={cfg.color} strokeWidth={3} />}
-                        {resultado === 'D' && <XIcon size={12} color={cfg.color} strokeWidth={3} />}
-                        {resultado === 'E' && <span style={{ width: 6, height: 6, borderRadius: '50%', background: cfg.color }} />}
-                      </span>
-                    )
-                  }
-
-                  const RachaFormaBloque = ({ equipo, racha, alinear }: { equipo: Equipo | undefined; racha: RachaYForma | undefined; alinear: 'flex-start' | 'flex-end' }) => (
-                    <div style={{
-                      flex: 1, display: 'flex', flexDirection: 'column', gap: 10,
-                      alignItems: alinear,
-                      padding: '14px 16px',
-                      borderRadius: 12,
-                      background: 'rgba(255,255,255,0.03)',
-                      border: '1px solid rgba(255,255,255,0.08)',
-                    }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexDirection: alinear === 'flex-end' ? 'row-reverse' : 'row' }}>
-                        {equipo?.escudo_url
-                          ? <img src={equipo.escudo_url} style={{ width: 18, height: 18, objectFit: 'contain', flexShrink: 0 }} />
-                          : <div style={{ width: 18, height: 18, borderRadius: 4, background: 'var(--color-border)', flexShrink: 0 }} />
-                        }
-                        <span style={{ fontSize: 11, fontWeight: 700, color: 'rgba(255,255,255,0.55)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
-                          {equipo?.nombre ?? ''}
-                        </span>
-                      </div>
-
-                      <div style={{ display: 'flex', gap: 5, flexDirection: alinear === 'flex-end' ? 'row-reverse' : 'row' }}>
-                        {racha && racha.ultimos5.length > 0 ? (
-                          racha.ultimos5.map((r, i) => <FormaDot key={i} resultado={r} />)
-                        ) : (
-                          <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.3)' }}>Sin historial</span>
-                        )}
-                      </div>
-
-                      <div style={{
-                        display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8,
-                        paddingTop: 10, marginTop: 2,
-                        borderTop: '1px solid rgba(255,255,255,0.06)',
-                        width: '100%',
-                      }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                          <Trophy size={12} color="#FFC800" />
-                          <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.5)' }}>
-                            Racha invicta máx.
-                          </span>
-                        </div>
-                        <span style={{
-                          fontSize: 12, fontWeight: 800, color: '#FFC800',
-                          background: 'rgba(255,200,0,0.14)', borderRadius: 6,
-                          padding: '2px 8px', lineHeight: 1.3,
-                        }}>
-                          {racha ? racha.rachaMaxima : '–'}
-                        </span>
-                      </div>
-                    </div>
-                  )
 
                   return (
                     <div key={partido.id} className="live-match-card">
@@ -1585,13 +1503,19 @@ export default function Public() {
                           </div>
 
                           {/* Marcador central */}
-                          <div style={{ display: 'flex', alignItems: 'center', gap: 14, flexShrink: 0 }}>
-                            <span className="live-match-score-num" style={{ fontSize: 52, fontWeight: 800, color: 'var(--color-textWH)', minWidth: 56, textAlign: 'center' }}>
-                              {golesLocal}
-                            </span>
-                            <span style={{ fontSize: 30, color: 'rgba(255,255,255,0.3)', fontWeight: 600 }}>:</span>
-                            <span className="live-match-score-num" style={{ fontSize: 52, fontWeight: 800, color: 'var(--color-textWH)', minWidth: 56, textAlign: 'center' }}>
-                              {golesVisitante}
+                          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6, flexShrink: 0 }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+                              <span className="live-match-score-num" style={{ fontSize: 52, fontWeight: 800, color: 'var(--color-textWH)', minWidth: 56, textAlign: 'center' }}>
+                                {golesLocal}
+                              </span>
+                              <span style={{ fontSize: 30, color: 'rgba(255,255,255,0.3)', fontWeight: 600 }}>:</span>
+                              <span className="live-match-score-num" style={{ fontSize: 52, fontWeight: 800, color: 'var(--color-textWH)', minWidth: 56, textAlign: 'center' }}>
+                                {golesVisitante}
+                              </span>
+                            </div>
+                            <span style={{ fontFamily: 'monospace', fontSize: 20, color: 'rgba(255, 255, 255, 0.5)', fontWeight: 700, letterSpacing: '0.5px' }}>
+                              {formatearDuracion(segundosActuales)}
+                              <span style={{ color: 'rgba(255,255,255,1)' }}></span>
                             </span>
                           </div>
 
@@ -1628,10 +1552,10 @@ export default function Public() {
                           </div>
                         </div>
                       </div>
-
+                      
                       {/* Probabilidad de victoria (feature 2: labels debajo de cada %, feature 6: nuevo algoritmo) */}
-                      <div style={{ padding: '4px 28px 22px' }}>
-                        <div style={{ fontSize: 11, fontWeight: 700, color: 'rgba(255,255,255,0.45)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8, textAlign: 'center' }}>
+                      <div style={{ padding: '4px 28px 22px', borderTop: '1px solid rgba(255,255,255,0.08)' }}>
+                        <div style={{ fontSize: 12, fontWeight: 800, color: 'rgba(255,255,255,0.6)', textTransform: 'uppercase', letterSpacing: '0.06em', marginTop: 8, marginBottom: 14, textAlign: 'center' }}>
                           Probabilidad de resultado
                         </div>
                         {recordsListos ? (
@@ -1647,19 +1571,19 @@ export default function Public() {
                             <div className="live-prob-row" style={{ display: 'flex', width: '100%', marginTop: 4 }}>
                               <div style={{ width: `${probs.local}%`, textAlign: 'center' }}>
                                 <span style={{ fontSize: 14, fontWeight: 800, color: colorLocal }}>{probs.local}%</span>
-                                <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.5)', fontWeight: 600, marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                <div style={{ fontSize: 10, color: colorLocal, fontWeight: 600, marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                                   {local?.nombre ?? 'Local'}
                                 </div>
                               </div>
                               <div style={{ width: `${probs.empate}%`, textAlign: 'center' }}>
                                 <span style={{ fontSize: 14, fontWeight: 800, color: colorEmpate }}>{probs.empate}%</span>
-                                <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.5)', fontWeight: 600, marginTop: 2 }}>
+                                <div style={{ fontSize: 10, color: colorEmpate, fontWeight: 600, marginTop: 2 }}>
                                   Empate
                                 </div>
                               </div>
                               <div style={{ width: `${probs.visitante}%`, textAlign: 'center' }}>
                                 <span style={{ fontSize: 14, fontWeight: 800, color: colorVisitante }}>{probs.visitante}%</span>
-                                <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.5)', fontWeight: 600, marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                <div style={{ fontSize: 10, color: colorVisitante, fontWeight: 600, marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                                   {visitante?.nombre ?? 'Visitante'}
                                 </div>
                               </div>
@@ -1676,23 +1600,6 @@ export default function Public() {
                         )}
                       </div>
 
-                      {/* Feature 1: racha máxima invicta + forma últimos 5 partidos */}
-                      <div style={{ padding: '0 28px 20px', borderTop: '1px solid rgba(255,255,255,0.08)' }}>
-                        <div style={{ paddingTop: 16, display: 'flex', gap: 12 }}>
-                          {rachaListas ? (
-                            <>
-                              <RachaFormaBloque equipo={local} racha={rachaLocal} alinear="flex-start" />
-                              <RachaFormaBloque equipo={visitante} racha={rachaVisitante} alinear="flex-end" />
-                            </>
-                          ) : (
-                            <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'rgba(255,255,255,0.4)', fontSize: 12, margin: '0 auto', padding: '14px' }}>
-                              <Loader2 size={14} className="spin" />
-                              Cargando racha y forma...
-                            </div>
-                          )}
-                        </div>
-                      </div>
-
                       {/* Feature 4: progresión de goles por intervalos de minutos */}
                       <div style={{ padding: '0 28px 26px', borderTop: '1px solid rgba(255,255,255,0.08)' }}>
                         <div style={{ paddingTop: 16, fontSize: 12, fontWeight: 800, color: 'rgba(255,255,255,0.6)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 14, textAlign: 'center' }}>
@@ -1705,7 +1612,7 @@ export default function Public() {
                               { equipo: visitante, progresion: progresionVisitante },
                             ].map(({ equipo, progresion }, rowIdx) => {
                               const totalGoles = progresion.conteos.reduce((a, b) => a + b, 0)
-                              const ANCHO_MIN_PCT = 2
+                              const ANCHO_MIN_PCT = 1
                               const anchoDisponible = 100 - ANCHO_MIN_PCT * INTERVALOS_GOLES.length
                               const anchosPct = progresion.conteos.map(c =>
                                 totalGoles > 0
@@ -2003,6 +1910,17 @@ export default function Public() {
                   <h2 style={{ fontSize: '20px', fontWeight: '700', margin: 0, lineHeight: '24px', whiteSpace: 'nowrap' }}>
                     Historial de partidos
                   </h2>
+                  {loadingElo && (
+                    <span style={{
+                      padding: '3px 10px', borderRadius: '20px',
+                      background: 'rgba(255,255,255,0.05)', border: '1px solid var(--color-border)',
+                      color: 'rgba(255,255,255,0.5)', fontSize: '12px', fontWeight: 600,
+                      display: 'flex', alignItems: 'center', gap: '6px',
+                    }}>
+                      <Loader2 size={12} className="spin" />
+                      Calculando ELO histórico...
+                    </span>
+                  )}
                 </div>
                 {teamMatches.length === 0 ? (
                   <div style={{ padding: '40px', borderRadius: '12px', border: '2px dashed var(--color-border)', textAlign: 'center', color: 'rgba(255,255,255,0.3)' }}>
@@ -2022,11 +1940,12 @@ export default function Public() {
 
                       const key = h2hKey(detail.partido.equipo_local_id, detail.partido.equipo_visitante_id)
                       const h2hTodos = h2hCache[key] || []
-                      const h2hPartidos = [...h2hTodos].sort((a, b) => {
-                        if (a.id === detail.partido.id) return -1
-                        if (b.id === detail.partido.id) return 1
-                        return 0
-                      })
+                      const h2hPartidos = h2hTodos
+
+                      // ─── ELO del partido: siempre viene del cálculo histórico
+                      // global (todas las ediciones), nunca recalculado de forma
+                      // aislada por torneo. ───
+                      const eloEntry = eloHistorialPorPartidoId[detail.partido.id]
 
                       return (
                         <div
@@ -2047,7 +1966,39 @@ export default function Public() {
                         >
                           <div className="side-bar" style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: '10px', backgroundColor: empate ? 'gray' : (localGano ? 'rgb(0, 200, 140)' : 'rgb(255, 77, 77)') }} />
                           <div className="side-bar" style={{ position: 'absolute', right: 0, top: 0, bottom: 0, width: '10px', backgroundColor: empate ? 'gray' : (visitanteGano ? 'rgb(0, 200, 140)' : 'rgb(255, 77, 77)') }} />
+                          {detail.partido.confirmado && (
+                            <div style={{
+                              position: 'absolute',
+                              bottom: 6,
+                              right: 16,
+                              width: 8,
+                              height: 8,
+                              borderRadius: '50%',
+                              background: '#00C88C',
+                              boxShadow: '0 0 4px #00C88C',
+                              zIndex: 10,
+                              pointerEvents: 'none',
+                            }} />
+                          )}
                           <div className="match-card-inner" style={{ margin: '0 30px' }}>
+                            {/* ── Fecha y hora de inicio (NUEVO) ── */}
+                            {detail.partido.inicio_timestamp && (
+                              <div style={{
+                                textAlign: 'center',
+                                paddingTop: '10px',
+                                fontSize: '10px',
+                                color: 'rgba(255,255,255,0.3)',
+                                fontWeight: 500,
+                              }}>
+                                {new Date(detail.partido.inicio_timestamp).toLocaleString('es-CO', {
+                                  year: 'numeric',
+                                  month: 'long',
+                                  day: 'numeric',
+                                  hour: '2-digit',
+                                  minute: '2-digit',
+                                })}
+                              </div>
+                            )}
                             <div style={{ padding: '16px 0' }}>
                               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 12 }}>
                                 <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 16 }}>
@@ -2097,6 +2048,54 @@ export default function Public() {
                                   ⏱ {formatearDuracion(detail.partido.duracion_segundos || 0)}
                                 </span>
                               </div>
+
+                              {/* ─── ELO inicial y final del partido (ambos equipos) ─── */}
+                              {eloEntry && (() => {
+                                const deltaLocal = Math.round(eloEntry.eloLocalDespues) - Math.round(eloEntry.eloLocalAntes)
+                                const deltaVisitante = Math.round(eloEntry.eloVisitanteDespues) - Math.round(eloEntry.eloVisitanteAntes)
+
+                                const TrendIcon = (delta: number) => delta > 0 ? TrendingUp : (delta < 0 ? TrendingDown : Minus)
+                                const trendColor = (delta: number) => delta > 0 ? 'var(--color-accent)' : (delta < 0 ? 'var(--color-error)' : 'rgba(255,255,255,0.4)')
+
+                                const EloBloque = ({ delta, antes, despues }: { delta: number; antes: number; despues: number }) => {
+                                  const Icon = TrendIcon(delta)
+                                  return (
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                                      <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.4)', fontWeight: 600 }}>
+                                        {Math.round(antes)}
+                                      </span>
+                                      <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.25)' }}>→</span>
+                                      <span style={{ fontSize: 13, fontWeight: 800, color: 'var(--color-textWH)' }}>
+                                        {Math.round(despues)}
+                                      </span>
+                                      <span style={{ display: 'flex', alignItems: 'center', gap: 2, color: trendColor(delta) }}>
+                                        <Icon size={12} />
+                                        <span style={{ fontSize: 11, fontWeight: 700 }}>
+                                          {delta > 0 ? `+${delta}` : delta}
+                                        </span>
+                                      </span>
+                                    </div>
+                                  )
+                                }
+
+                                return (
+                                  <div style={{
+                                    display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 24,
+                                    marginTop: 10, paddingTop: 10, borderTop: '1px dashed var(--color-border)',
+                                    flexWrap: 'wrap',
+                                  }}>
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                                      <Trophy size={11} color="rgba(255,255,255,0.3)" />
+                                      <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.35)', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                                        ELO
+                                      </span>
+                                    </div>
+                                    <EloBloque delta={deltaLocal} antes={eloEntry.eloLocalAntes} despues={eloEntry.eloLocalDespues} />
+                                    <span style={{ color: 'rgba(255,255,255,0.2)', fontSize: 11 }}>|</span>
+                                    <EloBloque delta={deltaVisitante} antes={eloEntry.eloVisitanteAntes} despues={eloEntry.eloVisitanteDespues} />
+                                  </div>
+                                )
+                              })()}
                             </div>
 
                             <div className={`map-container ${isExpanded ? 'expanded' : ''} ${h2hExpandido[detail.partido.id] ? 'h2h-open' : ''}`}>
@@ -2409,7 +2408,7 @@ export default function Public() {
                                                 )}
 
                                                 {hpFase && (
-                                                  <span title={hpFase.letra === 'G' ? 'Fase de grupos' : hpFase.letra === 'E' ? 'Eliminatoria' : 'Final'} style={{
+                                                  <span title={hpFase.nombre} style={{
                                                     flexShrink: 0,
                                                     fontSize: 11,
                                                     fontWeight: 800,
@@ -2627,8 +2626,13 @@ function BracketTorneo({ llave1, llave2, final, equipos }: { llave1: Partido[]; 
   }) => {
     const lId = localRefId(partidosLlave)
     const vId = visitanteRefId(partidosLlave)
-    const ida = partidosLlave[0]
-    const vuelta = partidosLlave[1]
+    const ordenados = [...partidosLlave].sort((a, b) => {
+      const ta = a.inicio_timestamp ? new Date(a.inicio_timestamp).getTime() : 0
+      const tb = b.inicio_timestamp ? new Date(b.inicio_timestamp).getTime() : 0
+      return ta - tb
+    })
+    const ida = ordenados[0]   // primer partido (ida)
+    const vuelta = ordenados[1] // segundo partido (vuelta)
 
     const idaLocalGoles = ida?.equipo_local_id === lId ? (ida?.goles_local ?? null) : (ida?.goles_visitante ?? null)
     const vueltaLocalGoles = vuelta ? (vuelta.equipo_local_id === lId ? vuelta.goles_local : vuelta.goles_visitante) : null

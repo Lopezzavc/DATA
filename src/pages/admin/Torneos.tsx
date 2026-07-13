@@ -35,9 +35,13 @@ interface Equipo {
 
 interface ModalState {
   torneo: Torneo
+  numero: number
   nombre: string
   edicion: string
-  fecha: string
+  created_at: string   // datetime-local format
+  activo: boolean
+  estado: Torneo['estado']
+  orden: number | null
   equiposSeleccionados: string[]
 }
 
@@ -95,6 +99,14 @@ function ordenarTorneos(lista: Torneo[]): Torneo[] {
     if (ob != null) return 1
     return b.numero - a.numero
   })
+}
+
+// Convierte fecha ISO a formato compatible con input datetime-local
+const toDatetimeLocal = (iso?: string | null): string => {
+  if (!iso) return ''
+  const d = new Date(iso)
+  if (isNaN(d.getTime())) return ''
+  return d.toISOString().slice(0, 16)
 }
 
 export default function Torneos() {
@@ -159,14 +171,16 @@ export default function Torneos() {
       .select('equipo_id')
       .eq('torneo_id', torneo.id)
     const vinculados = data ? data.map(r => r.equipo_id) : []
-    const fecha = torneo.created_at
-      ? new Date(torneo.created_at).toISOString().slice(0, 10)
-      : new Date().toISOString().slice(0, 10)
+
     setModal({
       torneo,
+      numero: torneo.numero,
       nombre: torneo.nombre ?? '',
       edicion: torneo.edicion ?? '',
-      fecha,
+      created_at: toDatetimeLocal(torneo.created_at),
+      activo: torneo.activo ?? false,
+      estado: torneo.estado,
+      orden: torneo.orden ?? null,
       equiposSeleccionados: vinculados,
     })
   }
@@ -187,15 +201,23 @@ export default function Torneos() {
   const guardar = async () => {
     if (!modal) return
     setGuardando(true)
-    const fechaISO = new Date(modal.fecha + 'T12:00:00').toISOString()
+
+    const payload: Record<string, any> = {
+      numero: modal.numero,
+      nombre: modal.nombre.trim() || null,
+      edicion: modal.edicion.trim() || null,
+      estado: modal.estado,
+      activo: modal.activo,
+      orden: modal.orden,
+    }
+
+    if (modal.created_at) {
+      payload.created_at = new Date(modal.created_at).toISOString()
+    }
 
     const { data } = await supabase
       .from('torneos')
-      .update({
-        nombre: modal.nombre || null,
-        edicion: modal.edicion || null,
-        created_at: fechaISO,
-      })
+      .update(payload)
       .eq('id', modal.torneo.id)
       .select()
       .single()
@@ -240,7 +262,6 @@ export default function Torneos() {
     if (guardandoOrdenRef.current) return
     guardandoOrdenRef.current = true
     try {
-      // Actualiza el campo `orden` de cada torneo según su posición actual
       await Promise.all(
         lista.map((t, index) =>
           supabase.from('torneos').update({ orden: index }).eq('id', t.id)
@@ -256,7 +277,6 @@ export default function Torneos() {
   const handleDragStart = (id: string) => (e: React.DragEvent) => {
     setDraggingId(id)
     e.dataTransfer.effectAllowed = 'move'
-    // Necesario en algunos navegadores para habilitar el drag
     try {
       e.dataTransfer.setData('text/plain', id)
     } catch {
@@ -383,6 +403,19 @@ export default function Torneos() {
                   <div>
                     <p style={{ fontWeight: '700', fontSize: '15px', color: 'var(--color-textWH)', margin: 0 }}>
                       {[torneo.edicion, torneo.nombre].filter(Boolean).join(' ') || `Torneo ${torneo.numero}`}
+                      {torneo.activo && (
+                        <span style={{
+                          marginLeft: '8px',
+                          padding: '2px 8px',
+                          borderRadius: '12px',
+                          background: 'rgba(0,200,140,0.15)',
+                          fontSize: '11px',
+                          fontWeight: '700',
+                          color: 'var(--color-accent)',
+                        }}>
+                          ACTIVO
+                        </span>
+                      )}
                     </p>
                     <p style={{ fontSize: '12px', color: 'var(--color-accent)', marginTop: '2px', marginBottom: 0 }}>
                       {new Date(torneo.created_at).toLocaleDateString('es-CO', { year: 'numeric', month: 'long', day: 'numeric' })}
@@ -552,6 +585,18 @@ export default function Torneos() {
               </button>
             </div>
 
+            {/* Número */}
+            <div>
+              <p style={LABEL}>Número</p>
+              <input
+                style={INPUT}
+                type="number"
+                value={modal.numero}
+                onChange={e => setModal(m => m ? { ...m, numero: parseInt(e.target.value) || 0 } : m)}
+              />
+            </div>
+
+            {/* Edición */}
             <div>
               <p style={LABEL}>Edición</p>
               <input
@@ -563,24 +608,80 @@ export default function Torneos() {
               />
             </div>
 
+            {/* Nombre */}
             <div>
               <p style={LABEL}>Nombre</p>
               <input
                 style={INPUT}
                 type="text"
-                placeholder={`Torneo ${modal.torneo.numero}`}
+                placeholder={`Torneo ${modal.numero}`}
                 value={modal.nombre}
                 onChange={e => setModal(m => m ? { ...m, nombre: e.target.value } : m)}
               />
             </div>
 
+            {/* Fecha y hora de creación */}
             <div>
-              <p style={LABEL}>Fecha</p>
+              <p style={LABEL}>Fecha de creación</p>
               <input
                 style={INPUT}
-                type="date"
-                value={modal.fecha}
-                onChange={e => setModal(m => m ? { ...m, fecha: e.target.value } : m)}
+                type="datetime-local"
+                value={modal.created_at}
+                onChange={e => setModal(m => m ? { ...m, created_at: e.target.value } : m)}
+              />
+            </div>
+
+            {/* Estado */}
+            <div>
+              <p style={LABEL}>Estado</p>
+              <div style={{ display: 'flex', gap: '8px' }}>
+                {(Object.keys(ESTADO_LABELS) as Torneo['estado'][]).map(est => (
+                  <button
+                    key={est}
+                    onClick={() => setModal(m => m ? { ...m, estado: est } : m)}
+                    style={{
+                      flex: 1,
+                      padding: '10px 8px',
+                      borderRadius: '10px',
+                      background: modal.estado === est ? ESTADO_COLORS[est].bg : 'transparent',
+                      border: `1px solid ${modal.estado === est ? ESTADO_COLORS[est].border : 'var(--color-border)'}`,
+                      color: modal.estado === est ? ESTADO_COLORS[est].text : 'rgba(255,255,255,0.5)',
+                      fontWeight: '600',
+                      fontSize: '12px',
+                      cursor: 'pointer',
+                      transition: 'all 0.15s',
+                    }}
+                  >
+                    {ESTADO_LABELS[est]}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Activo */}
+            <div>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '12px', cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={modal.activo}
+                  onChange={e => setModal(m => m ? { ...m, activo: e.target.checked } : m)}
+                  style={{ width: '18px', height: '18px', accentColor: 'var(--color-accent)' }}
+                />
+                <span style={{ ...LABEL, marginBottom: 0 }}>Torneo activo</span>
+              </label>
+            </div>
+
+            {/* Orden */}
+            <div>
+              <p style={LABEL}>Orden (posición en lista)</p>
+              <input
+                style={INPUT}
+                type="number"
+                value={modal.orden ?? ''}
+                onChange={e => {
+                  const val = e.target.value === '' ? null : parseInt(e.target.value)
+                  setModal(m => m ? { ...m, orden: isNaN(val as number) ? null : val } : m)
+                }}
               />
             </div>
 

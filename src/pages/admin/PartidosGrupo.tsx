@@ -1,5 +1,5 @@
 import { useEffect, useState, useRef, useCallback } from 'react'
-import { Calendar, Shuffle, Loader2, Save, Edit3, X, Settings, Play, Pause, Square, RotateCcw, Zap } from 'lucide-react'
+import { Calendar, Shuffle, Loader2, Save, Edit3, X, Settings, Play, Pause, Square, RotateCcw, Zap, ChevronDown } from 'lucide-react'
 import { supabase } from '../../lib/supabase'
 import { useTorneo } from '../../context/TorneoContext'
 import beachBall from '../../assets/powerups/beach-ball.png'
@@ -13,7 +13,7 @@ import block from '../../assets/powerups/block.png'
 import bigHead from '../../assets/powerups/big-head.png'
 import ghosted from '../../assets/powerups/ghosted.png'
 import movePlayer from '../../assets/powerups/move-player.png'
-import canchaImage from '../../assets/cancha.png' // Ajusta la ruta según tu proyecto
+import canchaImage from '../../assets/cancha.png'
 
 interface Equipo {
   id: string
@@ -24,14 +24,22 @@ interface Equipo {
 
 interface Partido {
   id: string
+  torneo_id: string
   jornada_id: string
+  fase: string
+  numero_llave: number | null
   equipo_local_id: string
   equipo_visitante_id: string
   goles_local: number | null
   goles_visitante: number | null
   fecha: string | null
+  created_at: string
   estado: string
   duracion_segundos: number
+  ronda: string | null
+  grupo_eliminatorio: number | null
+  inicio_timestamp: string | null
+  confirmado: boolean
 }
 
 interface Gol {
@@ -55,6 +63,18 @@ interface Editando {
   goles_visitante: string
   fecha: string
   usarFechaTorneo: boolean
+  estado: string
+  duracion_segundos: number
+  jornada_id: string
+  equipo_local_id: string
+  equipo_visitante_id: string
+  fase: string
+  numero_llave: string
+  ronda: string
+  grupo_eliminatorio: string
+  inicio_timestamp: string
+  created_at: string
+  confirmado: boolean
 }
 
 interface MatchManual {
@@ -75,7 +95,6 @@ interface PowerupUsado {
   cantidad: number
 }
 
-// Atajos de teclado para asignar power-ups rápidamente
 const POWERUP_SHORTCUTS: Record<string, string> = {
   'b': 'Boost',
   'm': 'Sticky Goo',
@@ -90,17 +109,6 @@ const POWERUP_SHORTCUTS: Record<string, string> = {
   'v': 'Move Player',
 }
 
-/**
- * Genera un fixture round-robin (todos contra todos, una vuelta) dinámico.
- * Funciona con cualquier cantidad de equipos (par o impar).
- * Si es impar, se agrega un "bye" (equipo fantasma) que hace que en cada
- * jornada un equipo distinto descanse; esos enfrentamientos con el bye
- * se descartan del resultado final.
- *
- * Con N equipos:
- *  - Par: N-1 jornadas, N/2 partidos cada una.
- *  - Impar: N jornadas, (N-1)/2 partidos cada una (un equipo descansa por jornada).
- */
 function generarFixture(idsOriginales: string[]): { local: string; visitante: string }[][] {
   const BYE = '__BYE__'
   let equipos = [...idsOriginales]
@@ -122,7 +130,6 @@ function generarFixture(idsOriginales: string[]): { local: string; visitante: st
       }
     }
     jornadas.push(ronda)
-    // Rotación estándar de round-robin (se fija el primer equipo)
     equipos.splice(1, 0, equipos.pop()!)
   }
 
@@ -138,7 +145,6 @@ function shuffle<T>(arr: T[]): T[] {
   return a
 }
 
-/** Oscurece un color hexadecimal multiplicando cada canal por un factor (0-1) */
 function darkenHex(hex: string, factor: number): string {
   const r = parseInt(hex.slice(1, 3), 16)
   const g = parseInt(hex.slice(3, 5), 16)
@@ -149,10 +155,6 @@ function darkenHex(hex: string, factor: number): string {
   return `#${nr.toString(16).padStart(2, '0')}${ng.toString(16).padStart(2, '0')}${nb.toString(16).padStart(2, '0')}`
 }
 
-/**
- * Calcula la cantidad de jornadas y partidos por jornada según el número
- * de equipos, siguiendo la misma lógica de generarFixture (round-robin a una vuelta).
- */
 function calcularDimensionesFixture(cantidadEquipos: number): { jornadas: number; partidosPorJornada: number } {
   if (cantidadEquipos < 2) return { jornadas: 0, partidosPorJornada: 0 }
   const esImpar = cantidadEquipos % 2 !== 0
@@ -219,8 +221,29 @@ export default function PartidosGrupo() {
   const [manualModal, setManualModal] = useState(false)
   const [manualJornadas, setManualJornadas] = useState<MatchManual[][]>([])
   const [jornadaManualActiva, setJornadaManualActiva] = useState(0)
+  const [mostrarAvanzado, setMostrarAvanzado] = useState(true)
 
-  // Estado del modal de partido en vivo
+  // Formateo para mostrar en inputs de texto
+  const formatDateForInput = (isoString: string | null, withTime: boolean): string => {
+    if (!isoString) return ''
+    const d = new Date(isoString)
+    if (isNaN(d.getTime())) return ''
+    const pad = (n: number) => n.toString().padStart(2, '0')
+    const datePart = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+    if (!withTime) return datePart
+    return `${datePart} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+  }
+
+  // Conversión de texto a ISO para guardar
+  const parseDateFromInput = (value: string, withTime: boolean): string | null => {
+    if (!value.trim()) return null
+    // Reemplazar espacio por T para facilitar parseo en timestamps
+    const normalized = withTime ? value.replace(' ', 'T') : value
+    const d = new Date(normalized)
+    if (isNaN(d.getTime())) return null
+    return d.toISOString()
+  }
+
   const [partidoEnVivo, setPartidoEnVivo] = useState<Partido | null>(null)
   const [golesLocalVivo, setGolesLocalVivo] = useState(0)
   const [golesVisitanteVivo, setGolesVisitanteVivo] = useState(0)
@@ -229,24 +252,20 @@ export default function PartidosGrupo() {
   const [, setJugando] = useState(false)
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
-  // Goles registrados en el partido en vivo
   const [golesPartido, setGolesPartido] = useState<Gol[]>([])
 
-  // Confirmación para reiniciar partido
   const [reiniciarModal, setReiniciarModal] = useState<Partido | null>(null)
 
   const [powerupsCatalogo, setPowerupsCatalogo] = useState<CatalogoPowerup[]>([])
   const [powerupsUsados, setPowerupsUsados] = useState<PowerupUsado[]>([])
   const [modalPowerup, setModalPowerup] = useState<{ equipoId: string; equipoNombre: string } | null>(null)
 
-  // ─── Power-ups en el modal de editar partido ───
   const [powerupsEditando, setPowerupsEditando] = useState<PowerupUsado[]>([])
   const [modalPowerupEditar, setModalPowerupEditar] = useState<{ equipoId: string; equipoNombre: string } | null>(null)
 
-  // ─── Modal de posición de gol ───
   const [showFieldModal, setShowFieldModal] = useState(false)
   const [pendingGoal, setPendingGoal] = useState<{ equipoId: string } | null>(null)
-  const [markerPos, setMarkerPos] = useState({ x: 50, y: 50 }) // porcentajes 0-100
+  const [markerPos, setMarkerPos] = useState({ x: 50, y: 50 })
   const [dragging, setDragging] = useState(false)
   const fieldRef = useRef<HTMLDivElement>(null)
 
@@ -295,7 +314,6 @@ export default function PartidosGrupo() {
     fetchPowerups()
   }, [])
 
-  // ─── Atajos de teclado para seleccionar power-up rápidamente ───
   useEffect(() => {
     if (!modalPowerup) return
 
@@ -381,8 +399,6 @@ export default function PartidosGrupo() {
         equiposUsados.add(m.local)
         equiposUsados.add(m.visitante)
       }
-      // En torneos con número impar de equipos, un equipo descansa cada jornada,
-      // por lo que el set de equipos usados será uno menos que el total.
       if (equiposUsados.size !== equipos.length && equiposUsados.size !== equipos.length - 1) {
         alert(`La jornada ${j + 1} no contiene una combinación válida de equipos`)
         return
@@ -423,15 +439,24 @@ export default function PartidosGrupo() {
   }
 
   const abrirEditar = async (partido: Partido) => {
-    const fecha = partido.fecha
-      ? new Date(partido.fecha).toISOString().slice(0, 10)
-      : ''
     setEditando({
       partidoId: partido.id,
       goles_local: partido.goles_local != null ? String(partido.goles_local) : '',
       goles_visitante: partido.goles_visitante != null ? String(partido.goles_visitante) : '',
-      fecha,
-      usarFechaTorneo: false,   // ← AGREGAR ESTA LÍNEA
+      fecha: formatDateForInput(partido.fecha, false),   // solo fecha
+      usarFechaTorneo: false,
+      estado: partido.estado ?? 'pendiente',
+      duracion_segundos: partido.duracion_segundos ?? 0,
+      jornada_id: partido.jornada_id,
+      equipo_local_id: partido.equipo_local_id,
+      equipo_visitante_id: partido.equipo_visitante_id,
+      fase: partido.fase,
+      numero_llave: partido.numero_llave != null ? String(partido.numero_llave) : '',
+      ronda: partido.ronda ?? '',
+      grupo_eliminatorio: partido.grupo_eliminatorio != null ? String(partido.grupo_eliminatorio) : '',
+      inicio_timestamp: formatDateForInput(partido.inicio_timestamp, true),
+      created_at: formatDateForInput(partido.created_at, true),
+      confirmado: partido.confirmado ?? false,
     })
 
     const { data: powerupsData } = await supabase
@@ -439,11 +464,12 @@ export default function PartidosGrupo() {
       .select('*')
       .eq('partido_id', partido.id)
     setPowerupsEditando((powerupsData as PowerupUsado[]) || [])
+    setMostrarAvanzado(true);
   }
 
   useEffect(() => {
     if (editando?.usarFechaTorneo && torneo?.created_at) {
-      const fechaTorneo = new Date(torneo.created_at).toISOString().slice(0, 10)
+      const fechaTorneo = formatDateForInput(torneo.created_at, false)
       setEditando(ed => (ed && ed.fecha !== fechaTorneo ? { ...ed, fecha: fechaTorneo } : ed))
     }
   }, [editando?.usarFechaTorneo, torneo?.created_at])
@@ -451,18 +477,34 @@ export default function PartidosGrupo() {
   const guardarPartido = async () => {
     if (!editando) return
     setGuardando(true)
-    const payload: Record<string, unknown> = {}
-    payload.goles_local = editando.goles_local !== '' ? parseInt(editando.goles_local) : null
-    payload.goles_visitante = editando.goles_visitante !== '' ? parseInt(editando.goles_visitante) : null
-    payload.fecha = editando.fecha ? new Date(editando.fecha + 'T12:00:00').toISOString() : null
+    const payload: Record<string, unknown> = {
+      goles_local: editando.goles_local !== '' ? parseInt(editando.goles_local) : null,
+      goles_visitante: editando.goles_visitante !== '' ? parseInt(editando.goles_visitante) : null,
+      fecha: parseDateFromInput(editando.fecha, false),
+      estado: editando.estado,
+      duracion_segundos: editando.duracion_segundos,
+      jornada_id: editando.jornada_id,
+      equipo_local_id: editando.equipo_local_id,
+      equipo_visitante_id: editando.equipo_visitante_id,
+      fase: editando.fase,
+      numero_llave: editando.numero_llave !== '' ? parseInt(editando.numero_llave) : null,
+      ronda: editando.ronda || null,
+      grupo_eliminatorio: editando.grupo_eliminatorio !== '' ? parseInt(editando.grupo_eliminatorio) : null,
+      inicio_timestamp: parseDateFromInput(editando.inicio_timestamp, true),
+      created_at: editando.created_at ? parseDateFromInput(editando.created_at, true) : undefined,
+      confirmado: editando.confirmado,
+    }
+
+    if (!editando.created_at) delete payload.created_at
+
     await supabase.from('partidos').update(payload).eq('id', editando.partidoId)
     await fetchData()
     setGuardando(false)
     setEditando(null)
     setPowerupsEditando([])
+    setMostrarAvanzado(false)
   }
 
-  // --- Power-ups dentro del modal de editar partido ---
   const usarPowerupEditando = async (equipoId: string, powerupId: string) => {
     if (!editando) return
     const existente = powerupsEditando.find(
@@ -513,7 +555,6 @@ export default function PartidosGrupo() {
     setPowerupsEditando(prev => prev.filter(pu => pu.id !== registro.id))
   }
 
-  // --- Reiniciar partido ---
   const confirmarReiniciar = (partido: Partido) => {
     setReiniciarModal(partido)
   }
@@ -521,30 +562,30 @@ export default function PartidosGrupo() {
   const ejecutarReinicio = async () => {
     if (!reiniciarModal) return
     const partido = reiniciarModal
-  
+
     const { error: errorGoles } = await supabase
       .from('goles')
       .delete()
       .eq('partido_id', partido.id)
-  
+
     if (errorGoles) {
       console.error('Error eliminando goles:', errorGoles)
       alert('Error eliminando goles: ' + errorGoles.message)
       return
     }
-  
+
     const { error: errorPowerups } = await supabase
       .from('powerups_usados')
       .delete()
       .eq('partido_id', partido.id)
-  
+
     if (errorPowerups) {
       console.error('Error eliminando powerups:', errorPowerups)
       alert('Error eliminando powerups: ' + errorPowerups.message)
       return
     }
     setPowerupsUsados([])
-  
+
     const { data: dataUpdate, error: errorUpdate } = await supabase
       .from('partidos')
       .update({
@@ -552,36 +593,36 @@ export default function PartidosGrupo() {
         goles_visitante: null,
         estado: 'pendiente',
         duracion_segundos: 0,
+        inicio_timestamp: null,   // ← NUEVO
       })
       .eq('id', partido.id)
       .select()
-    
+
     if (errorUpdate) {
       console.error('Error reiniciando partido:', errorUpdate)
       alert('Error actualizando partido: ' + errorUpdate.message)
       return
     }
-  
+
     if (!dataUpdate || dataUpdate.length === 0) {
       alert('No se pudo reiniciar el partido: sin permisos para actualizar (revisa RLS).')
       return
     }
-  
+
     setJornadas(prev =>
       prev.map(j => ({
         ...j,
         partidos: j.partidos.map(p =>
           p.id === partido.id
-            ? { ...p, goles_local: null, goles_visitante: null, estado: 'pendiente', duracion_segundos: 0, jugandose: false }
+            ? { ...p, goles_local: null, goles_visitante: null, estado: 'pendiente', duracion_segundos: 0, inicio_timestamp: null, jugandose: false }
             : p
         ),
       }))
     )
-  
+
     setReiniciarModal(null)
   }
 
-  // --- Lógica partido en vivo ---
   const abrirEnVivo = async (partido: Partido) => {
     setPartidoEnVivo(partido)
     setGolesLocalVivo(partido.goles_local ?? 0)
@@ -643,14 +684,13 @@ export default function PartidosGrupo() {
       .from('partidos')
       .update(updates)
       .eq('id', partidoEnVivo.id)
-  
+
     if (error) {
       console.error('Error al actualizar estado del partido:', error)
       alert('No se pudo guardar el estado del partido. Revisa los permisos o la estructura de la tabla.')
       return
     }
-  
-    // Actualizar estado local sin jugandose
+
     setJornadas(prev =>
       prev.map(j => ({
         ...j,
@@ -699,10 +739,10 @@ export default function PartidosGrupo() {
   const reanudarPartido = () => {
     if (!partidoEnVivo) return
     setJugando(true)
-  
+
     const nuevoInicio = new Date(Date.now() - segundos * 1000).toISOString()
     supabase.from('partidos').update({ inicio_timestamp: nuevoInicio }).eq('id', partidoEnVivo.id)
-  
+
     actualizarEstadoVivo('jugando', segundos)
     iniciarTimer(segundos)
   }
@@ -736,7 +776,6 @@ export default function PartidosGrupo() {
     )
   }
 
-  // Registrar gol con coordenadas
   const registrarGolConPosicion = async (equipoId: string, posX: number, posY: number) => {
     if (!partidoEnVivo || estadoVivo !== 'jugando') return
     const segundo = segundos
@@ -776,15 +815,13 @@ export default function PartidosGrupo() {
     setPendingGoal(null)
   }
 
-  // Abrir modal de campo para un gol pendiente
   const abrirModalCampo = (equipoId: string) => {
     if (!partidoEnVivo || estadoVivo !== 'jugando') return
     setPendingGoal({ equipoId })
-    setMarkerPos({ x: 50, y: 50 }) // centro por defecto
+    setMarkerPos({ x: 50, y: 50 })
     setShowFieldModal(true)
   }
 
-  // Manejo del clic en el campo
   const handleFieldClick = (e: React.MouseEvent<HTMLDivElement>) => {
     if (!fieldRef.current) return
     const rect = fieldRef.current.getBoundingClientRect()
@@ -793,7 +830,6 @@ export default function PartidosGrupo() {
     setMarkerPos({ x: Math.min(100, Math.max(0, x)), y: Math.min(100, Math.max(0, y)) })
   }
 
-  // Arrastre del marcador
   const handleMarkerMouseDown = (e: React.MouseEvent) => {
     e.stopPropagation()
     setDragging(true)
@@ -811,7 +847,6 @@ export default function PartidosGrupo() {
     setDragging(false)
   }
 
-  // Efecto para escuchar eventos globales de mouse
   useEffect(() => {
     if (dragging) {
       window.addEventListener('mousemove', handleMouseMove)
@@ -868,7 +903,7 @@ export default function PartidosGrupo() {
       if (data) setPowerupsUsados(prev => [...prev, data as PowerupUsado])
     }
   }
-  // Los botones "+" ahora abren el modal de campo
+
   const sumarGolLocal = () => {
     if (!partidoEnVivo) return
     abrirModalCampo(partidoEnVivo.equipo_local_id)
@@ -1101,7 +1136,6 @@ export default function PartidosGrupo() {
                           </span>
                         </div>
 
-                        {/* Botones de acción (tres) */}
                         <div style={{ display: 'flex', gap: '4px', flexShrink: 0 }}>
                           <button
                             onClick={() => abrirEnVivo(partido)}
@@ -1204,64 +1238,64 @@ export default function PartidosGrupo() {
         const local = partido ? equipoById(partido.equipo_local_id) : null
         const visitante = partido ? equipoById(partido.equipo_visitante_id) : null
         return (
-          <div style={OVERLAY} onClick={() => { setEditando(null); setPowerupsEditando([]) }}>
-            <div style={MODAL} onClick={e => e.stopPropagation()}>
+          <div style={OVERLAY} onClick={() => { setEditando(null); setPowerupsEditando([]); setMostrarAvanzado(false) }}>
+            <div style={{ ...MODAL, maxWidth: '600px' }} onClick={e => e.stopPropagation()}>
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                 <span style={{ fontWeight: '700', fontSize: '16px', color: 'var(--color-textWH)' }}>
                   Editar partido
                 </span>
-                <button onClick={() => { setEditando(null); setPowerupsEditando([]) }} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'rgba(255,255,255,0.4)' }}>
+                <button onClick={() => { setEditando(null); setPowerupsEditando([]); setMostrarAvanzado(false) }} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'rgba(255,255,255,0.4)' }}>
                   <X size={16} />
                 </button>
               </div>
 
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '16px' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                  {local?.escudo_url
-                    ? <img src={local.escudo_url} alt="" style={{ width: '40px', height: '40px', objectFit: 'contain' }} />
-                    : <div style={{ width: '40px', height: '40px', borderRadius: '8px', background: 'var(--color-border)' }} />
-                  }
-                  <span style={{ fontSize: '16px', fontWeight: '700', color: 'var(--color-textWH)' }}>{local?.nombre}</span>
-                </div>
-                <span style={{ fontSize: '14px', color: 'rgba(255,255,255,0.3)', fontWeight: '600' }}>vs</span>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                  <span style={{ fontSize: '16px', fontWeight: '700', color: 'var(--color-textWH)' }}>{visitante?.nombre}</span>
-                  {visitante?.escudo_url
-                    ? <img src={visitante.escudo_url} alt="" style={{ width: '40px', height: '40px', objectFit: 'contain' }} />
-                    : <div style={{ width: '40px', height: '40px', borderRadius: '8px', background: 'var(--color-border)' }} />
-                  }
-                </div>
+              {/* Equipos */}
+              <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
+                <select
+                  value={editando.equipo_local_id}
+                  onChange={e => setEditando(ed => ed ? { ...ed, equipo_local_id: e.target.value } : ed)}
+                  style={{ ...SELECT_STYLE, flex: 1 }}
+                >
+                  {equipos.map(eq => (
+                    <option key={eq.id} value={eq.id}>{eq.nombre}</option>
+                  ))}
+                </select>
+                <span style={{ color: 'rgba(255,255,255,0.3)' }}>vs</span>
+                <select
+                  value={editando.equipo_visitante_id}
+                  onChange={e => setEditando(ed => ed ? { ...ed, equipo_visitante_id: e.target.value } : ed)}
+                  style={{ ...SELECT_STYLE, flex: 1 }}
+                >
+                  {equipos.map(eq => (
+                    <option key={eq.id} value={eq.id}>{eq.nombre}</option>
+                  ))}
+                </select>
               </div>
 
+              {/* Resultado */}
               <div>
                 <p style={LABEL}>Resultado</p>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
                   <input
                     style={{ ...INPUT, textAlign: 'center', fontWeight: '700', fontSize: '20px' }}
-                    type="number"
-                    min={0}
-                    placeholder="—"
+                    type="number" min={0} placeholder="—"
                     value={editando.goles_local}
                     onChange={e => setEditando(ed => ed ? { ...ed, goles_local: e.target.value } : ed)}
                   />
-                  <span style={{ fontSize: '18px', color: 'rgba(255,255,255,0.3)', fontWeight: '700', flexShrink: 0 }}>:</span>
+                  <span style={{ fontSize: '18px', color: 'rgba(255,255,255,0.3)', fontWeight: '700' }}>:</span>
                   <input
                     style={{ ...INPUT, textAlign: 'center', fontWeight: '700', fontSize: '20px' }}
-                    type="number"
-                    min={0}
-                    placeholder="—"
+                    type="number" min={0} placeholder="—"
                     value={editando.goles_visitante}
                     onChange={e => setEditando(ed => ed ? { ...ed, goles_visitante: e.target.value } : ed)}
                   />
                 </div>
               </div>
 
+              {/* Fecha */}
               <div>
                 <p style={LABEL}>Fecha</p>
-                <label style={{
-                  display: 'flex', alignItems: 'center', gap: '8px',
-                  marginBottom: '8px', cursor: 'pointer', userSelect: 'none',
-                }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px', cursor: 'pointer' }}>
                   <input
                     type="checkbox"
                     checked={editando.usarFechaTorneo}
@@ -1270,31 +1304,91 @@ export default function PartidosGrupo() {
                       setEditando(ed => {
                         if (!ed) return ed
                         if (marcado && torneo?.created_at) {
-                          return {
-                            ...ed,
-                            usarFechaTorneo: true,
-                            fecha: new Date(torneo.created_at).toISOString().slice(0, 10),
-                          }
+                          const fechaTorneo = formatDateForInput(torneo.created_at, false)
+                          return { ...ed, usarFechaTorneo: true, fecha: fechaTorneo }
                         }
                         return { ...ed, usarFechaTorneo: marcado }
                       })
                     }}
-                    style={{ width: '16px', height: '16px', cursor: 'pointer', accentColor: 'var(--color-accent)' }}
+                    style={{ width: '16px', height: '16px', accentColor: 'var(--color-accent)' }}
                   />
-                  <span style={{ fontSize: '13px', color: 'rgba(255,255,255,0.7)' }}>
-                    Usar fecha del torneo
-                  </span>
+                  <span style={{ fontSize: '13px', color: 'rgba(255,255,255,0.7)' }}>Usar fecha del torneo</span>
                 </label>
+                <div style={{ display: 'flex', gap: '8px' }}>
+                  <input
+                    style={{ ...INPUT, opacity: editando.usarFechaTorneo ? 0.6 : 1, flex: 1 }}
+                    type="text"
+                    placeholder="YYYY-MM-DD"
+                    disabled={editando.usarFechaTorneo}
+                    value={editando.fecha}
+                    onChange={e => setEditando(ed => ed ? { ...ed, fecha: e.target.value } : ed)}
+                  />
+                  <button
+                    type="button"
+                    disabled={editando.usarFechaTorneo}
+                    onClick={() => (document.getElementById('hidden-date-picker') as HTMLInputElement)?.showPicker?.()}
+                    style={{
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      width: '40px', height: '40px', borderRadius: '10px',
+                      background: 'var(--color-border)', border: '1px solid var(--color-border)',
+                      color: 'var(--color-textWH)', cursor: editando.usarFechaTorneo ? 'not-allowed' : 'pointer',
+                      opacity: editando.usarFechaTorneo ? 0.6 : 1,
+                    }}
+                  >
+                    <Calendar size={18} />
+                  </button>
+                </div>
                 <input
-                  style={{ ...INPUT, opacity: editando.usarFechaTorneo ? 0.6 : 1 }}
+                  id="hidden-date-picker"
                   type="date"
-                  disabled={editando.usarFechaTorneo}
-                  value={editando.fecha}
-                  onChange={e => setEditando(ed => ed ? { ...ed, fecha: e.target.value } : ed)}
+                  style={{ position: 'absolute', opacity: 0, pointerEvents: 'none', width: 0, height: 0 }}
+                  onChange={e => {
+                    if (!e.target.value) return
+                    setEditando(ed => ed ? { ...ed, fecha: e.target.value } : ed)
+                  }}
                 />
               </div>
 
-              {/* Power-ups del partido */}
+              {/* Estado y duración */}
+              <div style={{ display: 'flex', gap: '10px' }}>
+                <div style={{ flex: 1 }}>
+                  <p style={LABEL}>Estado</p>
+                  <select
+                    value={editando.estado}
+                    onChange={e => setEditando(ed => ed ? { ...ed, estado: e.target.value } : ed)}
+                    style={SELECT_STYLE}
+                  >
+                    <option value="pendiente">Pendiente</option>
+                    <option value="jugando">Jugando</option>
+                    <option value="pausado">Pausado</option>
+                    <option value="finalizado">Finalizado</option>
+                  </select>
+                </div>
+                <div style={{ flex: 1 }}>
+                  <p style={LABEL}>Duración (seg)</p>
+                  <input
+                    style={INPUT}
+                    type="number" min={0}
+                    value={editando.duracion_segundos}
+                    onChange={e => setEditando(ed => ed ? { ...ed, duracion_segundos: parseInt(e.target.value) || 0 } : ed)}
+                  />
+                </div>
+              </div>
+
+              {/* Confirmado */}
+              <div>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '12px', cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={editando.confirmado}
+                    onChange={e => setEditando(ed => ed ? { ...ed, confirmado: e.target.checked } : ed)}
+                    style={{ width: '18px', height: '18px', accentColor: 'var(--color-accent)' }}
+                  />
+                  <span style={{ ...LABEL, marginBottom: 0 }}>Confirmado</span>
+                </label>
+              </div>
+
+              {/* Power-ups */}
               <div>
                 <p style={LABEL}>Power-ups</p>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
@@ -1430,6 +1524,166 @@ export default function PartidosGrupo() {
                     </div>
                   </div>
                 </div>
+              </div>
+
+              {/* Sección Avanzada */}
+              <div>
+                <button
+                  onClick={() => setMostrarAvanzado(!mostrarAvanzado)}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: '8px',
+                    background: 'none', border: 'none', color: 'rgba(255,255,255,0.5)',
+                    fontWeight: '600', fontSize: '13px', cursor: 'pointer', padding: 0,
+                  }}
+                >
+                  <ChevronDown
+                    size={14}
+                    style={{
+                      transform: mostrarAvanzado ? 'rotate(180deg)' : 'none',
+                      transition: 'transform 0.2s',
+                    }}
+                  />
+                  Avanzado
+                </button>
+                {mostrarAvanzado && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '14px', marginTop: '12px' }}>
+                    {/* Jornada */}
+                    <div>
+                      <p style={LABEL}>Jornada</p>
+                      <select
+                        value={editando.jornada_id}
+                        onChange={e => setEditando(ed => ed ? { ...ed, jornada_id: e.target.value } : ed)}
+                        style={SELECT_STYLE}
+                      >
+                        {jornadas.map(j => (
+                          <option key={j.id} value={j.id}>Jornada {j.numero}</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    {/* Fase */}
+                    <div>
+                      <p style={LABEL}>Fase</p>
+                      <input
+                        style={INPUT}
+                        type="text"
+                        value={editando.fase}
+                        onChange={e => setEditando(ed => ed ? { ...ed, fase: e.target.value } : ed)}
+                      />
+                    </div>
+
+                    {/* Numero llave, Ronda, Grupo eliminatorio */}
+                    <div style={{ display: 'flex', gap: '10px' }}>
+                      <div style={{ flex: 1 }}>
+                        <p style={LABEL}>Nº Llave</p>
+                        <input
+                          style={INPUT}
+                          type="number"
+                          value={editando.numero_llave}
+                          onChange={e => setEditando(ed => ed ? { ...ed, numero_llave: e.target.value } : ed)}
+                        />
+                      </div>
+                      <div style={{ flex: 1 }}>
+                        <p style={LABEL}>Ronda</p>
+                        <input
+                          style={INPUT}
+                          type="text"
+                          value={editando.ronda}
+                          onChange={e => setEditando(ed => ed ? { ...ed, ronda: e.target.value } : ed)}
+                        />
+                      </div>
+                      <div style={{ flex: 1 }}>
+                        <p style={LABEL}>Grupo Elim.</p>
+                        <input
+                          style={INPUT}
+                          type="number"
+                          value={editando.grupo_eliminatorio}
+                          onChange={e => setEditando(ed => ed ? { ...ed, grupo_eliminatorio: e.target.value } : ed)}
+                        />
+                      </div>
+                    </div>
+
+                    <div>
+                      <p style={LABEL}>Inicio (timestamp)</p>
+                      <div style={{ display: 'flex', gap: '8px' }}>
+                        <input
+                          style={{ ...INPUT, flex: 1 }}
+                          type="text"
+                          placeholder="YYYY-MM-DD HH:mm:ss"
+                          value={editando.inicio_timestamp}
+                          onChange={e => setEditando(ed => ed ? { ...ed, inicio_timestamp: e.target.value } : ed)}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => (document.getElementById('hidden-inicio-picker') as HTMLInputElement)?.showPicker?.()}
+                          style={{
+                            display: 'flex', alignItems: 'center', justifyContent: 'center',
+                            width: '40px', height: '40px', borderRadius: '10px',
+                            background: 'var(--color-border)', border: '1px solid var(--color-border)',
+                            color: 'var(--color-textWH)', cursor: 'pointer',
+                          }}
+                        >
+                          <Calendar size={18} />
+                        </button>
+                      </div>
+                      <input
+                        id="hidden-inicio-picker"
+                        type="datetime-local"
+                        style={{ position: 'absolute', opacity: 0, pointerEvents: 'none', width: 0, height: 0 }}
+                        onChange={e => {
+                          if (!e.target.value) return
+                          // Convertir del formato "YYYY-MM-DDTHH:mm" a "YYYY-MM-DD HH:mm:00"
+                          const val = e.target.value
+                          if (val) {
+                            const formatted = val.replace('T', ' ') + ':00'
+                            setEditando(ed => ed ? { ...ed, inicio_timestamp: formatted } : ed)
+                          }
+                        }}
+                      />
+                    </div>
+
+                    {/* Campo created_at dentro de la sección "Avanzado" */}
+                    <div>
+                      <p style={LABEL}>Creado (timestamp)</p>
+                      <div style={{ display: 'flex', gap: '8px' }}>
+                        <input
+                          style={{ ...INPUT, flex: 1 }}
+                          type="text"
+                          placeholder="YYYY-MM-DD HH:mm:ss"
+                          value={editando.created_at}
+                          onChange={e => setEditando(ed => ed ? { ...ed, created_at: e.target.value } : ed)}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => (document.getElementById('hidden-created-picker') as HTMLInputElement)?.showPicker?.()}
+                          style={{
+                            display: 'flex', alignItems: 'center', justifyContent: 'center',
+                            width: '40px', height: '40px', borderRadius: '10px',
+                            background: 'var(--color-border)', border: '1px solid var(--color-border)',
+                            color: 'var(--color-textWH)', cursor: 'pointer',
+                          }}
+                        >
+                          <Calendar size={18} />
+                        </button>
+                      </div>
+                      {/* Selector oculto: sincroniza su valor con el campo de texto */}
+                      <input
+                        id="hidden-created-picker"
+                        type="datetime-local"
+                        style={{ position: 'absolute', opacity: 0, pointerEvents: 'none', width: 0, height: 0 }}
+                        onChange={e => {
+                          if (!e.target.value) return
+                          // El picker devuelve algo como "2026-07-11T15:30", lo convertimos a "YYYY-MM-DD HH:mm:00"
+                          const val = e.target.value
+                          if (val) {
+                            const formatted = val.replace('T', ' ') + ':00'
+                            setEditando(ed => ed ? { ...ed, created_at: formatted } : ed)
+                          }
+                        }}
+                      />
+                    </div>
+                  </div>
+                )}
               </div>
 
               <button

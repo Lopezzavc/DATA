@@ -39,6 +39,7 @@ interface ModalState {
   escudo_url: string | null
   campeonatos: number
   color_hex: string
+  created_at: string // formato datetime-local: YYYY-MM-DDTHH:mm
 }
 
 const OVERLAY: React.CSSProperties = {
@@ -61,6 +62,14 @@ const INPUT: React.CSSProperties = {
   color: 'var(--color-textWH)', fontSize: '14px', boxSizing: 'border-box',
 }
 
+// Convierte fecha ISO a formato compatible con input datetime-local
+const toDatetimeLocal = (isoString?: string | null): string => {
+  if (!isoString) return ''
+  const date = new Date(isoString)
+  if (isNaN(date.getTime())) return ''
+  return date.toISOString().slice(0, 16) // 'YYYY-MM-DDTHH:mm'
+}
+
 const modalVacio = (): ModalState => ({
   equipo: null,
   nombre: '',
@@ -68,6 +77,7 @@ const modalVacio = (): ModalState => ({
   escudo_url: null,
   campeonatos: 0,
   color_hex: '#00C88C',
+  created_at: toDatetimeLocal(new Date().toISOString()), // por defecto ahora
 })
 
 export default function Equipos() {
@@ -97,18 +107,23 @@ export default function Equipos() {
       escudo_url: equipo.escudo_url,
       campeonatos: equipo.campeonatos,
       color_hex: equipo.color_hex || '#00C88C',
+      created_at: toDatetimeLocal(equipo.created_at),
     })
   }
 
   const guardar = async () => {
     if (!modal || !modal.nombre.trim() || !modal.dt.trim()) return
     setGuardando(true)
-    const payload = {
+    const payload: Record<string, any> = {
       nombre: modal.nombre.trim(),
       dt: modal.dt.trim(),
       escudo_url: modal.escudo_url,
       campeonatos: modal.campeonatos,
       color_hex: modal.color_hex,
+    }
+    // Si hay una fecha definida, la enviamos (convertida a ISO)
+    if (modal.created_at) {
+      payload.created_at = new Date(modal.created_at).toISOString()
     }
     if (modal.equipo) {
       await supabase.from('equipos').update(payload).eq('id', modal.equipo.id)
@@ -190,6 +205,9 @@ export default function Equipos() {
                         🏆 {equipo.campeonatos}
                       </span>
                     )}
+                  </p>
+                  <p style={{ fontSize: '11px', color: 'rgba(255,255,255,0.3)', marginTop: '2px', marginBottom: 0 }}>
+                    Creado: {new Date(equipo.created_at).toLocaleDateString('es-CO', { year: 'numeric', month: 'short', day: 'numeric' })}
                   </p>
                 </div>
               </div>
@@ -364,6 +382,17 @@ export default function Equipos() {
               <p style={LABEL}>Campeonatos</p>
               <input style={INPUT} type="number" min={0} value={modal.campeonatos}
                 onChange={e => setModal(m => m ? { ...m, campeonatos: parseInt(e.target.value) || 0 } : m)} />
+            </div>
+
+            {/* Fecha de creación */}
+            <div>
+              <p style={LABEL}>Fecha de creación</p>
+              <input
+                style={INPUT}
+                type="datetime-local"
+                value={modal.created_at}
+                onChange={e => setModal(m => m ? { ...m, created_at: e.target.value } : m)}
+              />
             </div>
 
             {/* Color representativo */}
